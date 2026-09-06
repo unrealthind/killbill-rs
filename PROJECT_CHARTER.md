@@ -1,0 +1,285 @@
+# Project Charter — killbill-rs
+
+**Document status:** Draft v1 — guiding document for the engineering team
+**Last updated:** 2026-09-06
+**Owner:** Project lead
+**Audience:** Programmers building v1, and anyone extending the tool later
+
+---
+
+## 1. Purpose
+
+Build a modern, event-driven successor to the original `usbkill` Python tool. The program monitors USB device add/remove events and, when an unauthorized change is detected while armed, powers off the machine quickly so that a LUKS-encrypted disk re-locks and its contents become inaccessible.
+
+This is a ground-up rewrite, not a port. The original's polling loop, embedded interpreter fragility, silent-failure modes, and destructive-by-accident behavior are explicitly discarded. This charter is the single source of truth for what v1 is, what it is not, and why.
+
+The project is also a **learning-oriented codebase**. Where a clear, teachable design conflicts with maximum hardening, favor clarity — but never at the cost of the correctness of the kill path itself.
+
+---
+
+## 2. Target user & threat model
+
+**User:** A single high-risk individual (e.g. journalist, activist, researcher) protecting their own machine against physical seizure or tampering.
+
+**Implications that shape the whole design:**
+
+- On-device only. No network, no telemetry, no central management, no fleet features.
+- The user is root on their own machine and accepts the risk of destructive response.
+- One user, one authority. No multi-tenant privilege model is needed.
+- Full-disk encryption (LUKS) is **assumed to be in place**. The tool's job is to cut power so the disk re-locks; it is not responsible for encrypting the disk.
+
+**Non-users / out of scope:** Managed corporate fleets, audited endpoints, anything requiring remote configuration or logging.
+
+---
+
+## 3. Guiding principles
+
+1. **The kill path is sacred.** Nothing — logging, config quirks, UI state — may be able to prevent or delay a poweroff once a kill decision is made.
+2. **Fail closed.** An invalid config disarms the tool loudly; it never fires blindly or guesses intent.
+3. **Dangerous features require deliberate, unambiguous opt-in.** No destructive action can be enabled by a stray boolean.
+4. **Separation of concerns.** Detection, decision, and response are independent stages with clean seams.
+5. **Portable and pluggable foundation.** v1 implements USB only, but the architecture must let others add sensors and responders without touching the core.
+6. **One authority for state.** The daemon owns configuration and armed-state; UIs are clients, never competing sources of truth.
+7. **Prefer clarity for a learning codebase**, except in the kill path, which prefers correctness above all.
+
+---
+
+## 4. Language & platform decisions
+
+| Decision | Choice | Rationale |
+|---|---|---|
+| Language | **Rust** | Single static binary, no runtime to install, memory safety for a root daemon operating under adversarial physical access. |
+| Detection foundation | **Kernel netlink uevent socket** (`NETLINK_KOBJECT_UEVENT`) | Event-driven, millisecond reaction, near-zero idle CPU, closes the fast-swap evasion gap. Interface is ~20 years stable, so kernel version is a non-constraint. |
+| Init / supervision | **systemd** | Restart-on-crash, boot-time arming, clean status, hardening directives. Non-systemd init is out of scope for v1. |
+| Async runtime | **Tokio** (recommended) | Natural fit for "several tasks listening on channels and sockets at once." A hand-rolled `mio`+threads version is an acceptable alternative if the team wants fewer dependencies — see §13. |
+| Config format | **TOML** | Typed, human-editable, Rust-ecosystem default. Replaces the original's ini-with-embedded-JSON. |
+| TUI toolkit | **ratatui** | Actively maintained, mature. |
+| Control transport | **Unix domain socket**, `SOCK_SEQPACKET` | Local-only, permission-controlled, no network exposure. |
+
+**Kernel floor:** Not feature-driven. Effectively "whatever runs a current systemd" — any mainstream distro from the last several years. Build against the stable, decades-old netlink interface so kernel version never becomes a compatibility concern.
+
+---
+
+## 5. Response model
+
+**Core response (v1):** Fast, reliable **poweroff**, assuming LUKS. The destructive side of the tool exists only to cut power so the encrypted disk re-locks. No file shredding. No RAM/swap wiping. These were the original's least reliable features on modern SSDs and are deliberately dropped.
+
+**Option B — LUKS header destruction (scaffolded, fenced off, NOT live in v1):**
+
+Because LUKS is assumed, the correct "destroy data" primitive is not per-file shredding but **destroying the LUKS header/keyslot**, which renders the whole disk unrecoverable in milliseconds and is reliable on flash storage.
+
+This feature is **fenced behind deliberate friction** so it cannot be armed by accident:
+
+- **Off by default**, and absent from the default config entirely.
+- Cannot be enabled implicitly. Requires a distinctly-named, unambiguous acknowledgment key in config (e.g. `i_understand_this_is_irreversible = true`), not a generic `enabled = true`.
+- In the TUI it lives on a **separate, visually-distinct warning screen** and requires typing a confirmation word (e.g. `DESTROY`), and it names the exact target device so the user can verify it is real.
+- **Daemon refuses to arm** if the destruction target is invalid or does not resolve to a real LUKS device (fail-closed).
+- **Dry-run treats it specially:** always logs "would destroy LUKS header on `/dev/…`" and never touches the header.
+
+**v1 ships this as a stub.** The config schema, validation, TUI screen, and dry-run messaging are all present and correct; the actual header-wipe is deliberately not implemented, so there is no live footgun during development. It can be flipped on in a later version.
+
+---
+
+## 6. Architecture overview
+
+The founding decision: **separate detection from decision from response.** The original fused all three into one polling loop, which is why it could not be extended and why a logging failure could block a shutdown.
+
+```
+  SENSORS          →   CORE (decision)   →   RESPONDERS
+  (pluggable)          (policy engine)       (pluggable)
+      │                     │                     │
+  USB sensor ──┐            │                ┌── poweroff responder
+  [lid]     ──┤            │                ├── luks-destroy responder (fenced/stub)
+  [ac-power]──┤──► event ──►  policy  ──► action ──┤── logger (as a responder)
+  [bluetooth]─┘   stream       engine     decision └── [alert] [custom]
+                                 │
+                                 ├──────────► CONTROL SOCKET ──► TUI / CLI
+                                 │            (query + subscribe + command)
+                                 └── config (owned by daemon)
+```
+
+Bracketed `[…]` items are **not built in v1** — they are what the pluggable abstraction permits. Only the USB sensor and the poweroff + logger responders are implemented.
+
+### The three seams
+
+**Seam 1 — the `Sensor` trait (input).** A sensor produces tamper-relevant events. Contract: "start, emit normalized `SensorEvent`s onto a channel until stopped." It knows nothing about policy or response. The USB sensor opens the netlink uevent socket, parses add/remove messages into `SensorEvent { source, kind, identity, raw }`, and pushes them onto the shared channel. A future lid sensor emits its own events onto the *same* channel; the core treats them identically.
+
+**Seam 2 — the `Responder` trait (output).** A responder receives an `Action` and acts. `poweroff` cuts power; `logger` records; `luks-destroy` (stub) wipes the header. **The logger is just another responder, not a prerequisite** — responders are independent subscribers to the action decision, so a logging failure can never block the poweroff. This directly fixes a real bug in the original.
+
+**Seam 3 — the control protocol (the TUI's window in).** The request/reply + event-stream protocol over the Unix socket. Because v1 has a live TUI, this is a first-class public interface, not an afterthought.
+
+The normalized `SensorEvent` and `Action` vocabularies in the middle are the entire secret to portability: sensors and responders share common types, so the policy engine is decoupled from both ends.
+
+---
+
+## 7. Components
+
+### 7.1 `killbilld` — the daemon (root, systemd-managed)
+
+The heart of the system. Responsibilities:
+
+- Owns and loads config; single source of truth for policy and armed-state.
+- Instantiates enabled sensors and starts them.
+- **Policy engine:** for each `SensorEvent`, decides against the whitelist/policy whether it warrants an `Action`; if so, dispatches to all responders.
+- **Control server:** accepts TUI/CLI connections; answers queries, streams events, executes commands.
+- **Event fan-out:** the raw sensor stream feeds two consumers — the policy engine *and* any subscribed control clients — so the TUI sees exactly what the daemon sees.
+
+**Internal shape (recommended):** an async runtime with a few tasks over channels: sensor tasks → central event bus → {policy task, control-server broadcast}. Testable, and where much of the concurrency learning lives.
+
+### 7.2 `killbill-tui` — the live configurator
+
+A **separate binary** so a UI crash can never touch protection. Connects to the control socket and provides:
+
+- Live view of currently-connected USB devices.
+- **Plug-and-whitelist:** plug a device, it appears highlighted as new/unknown, press a key to add it to the whitelist (the daemon performs the write).
+- Show and toggle armed/disarmed.
+- Run dry-run and display what *would* happen.
+- The fenced-off destruction screen with its typed-confirmation guard rail (§5).
+
+### 7.3 `killbillctl` — the CLI
+
+The dependable, scriptable, headless-friendly path. Everything the TUI can do, the CLI can do — the TUI is a nicety on the same protocol, never the only way in.
+
+Commands: `status`, `arm`, `disarm`, `test` (dry-run), `whitelist add|remove|list`, `reload`.
+
+---
+
+## 8. Control protocol
+
+One `SOCK_SEQPACKET` Unix socket at `/run/killbilld.sock`. Three traffic types:
+
+- **Commands (client → daemon, expect reply):** `GetStatus`, `ListDevices`, `Arm`, `Disarm`, `WhitelistAdd(device_id)`, `WhitelistRemove(device_id)`, `RunDryRun`, `ReloadConfig`.
+- **Replies (daemon → client):** success/failure + payload.
+- **Event stream (daemon → client, unsolicited, to subscribers):** `DeviceAdded`, `DeviceRemoved`, `Armed`, `Disarmed`, `WouldKill(reason)` (dry-run).
+
+**Framing:** length-prefixed messages. **Serialization:** serde + JSON for v1 (readable and debuggable for a learning codebase; swappable to a binary codec later without changing the protocol shape).
+
+**Access control:** socket file permissions — mode `0660`, owned by root. "Who can talk to the daemon" is a filesystem question. Sufficient for a single-user personal tool.
+
+**Disarm is a command, never a signal.** This replaces the original's fatal flaw of using catchable `SIGTERM`/`SIGINT`/`SIGQUIT` to disarm. To disarm, a client sends an authenticated `Disarm` over the socket, which is logged. OS signals go back to meaning only "shut down the process."
+
+---
+
+## 9. Configuration
+
+**Location:** `/etc/killbill/config.toml`
+**Ownership:** The **daemon owns writes.** The TUI requests changes; the daemon validates and writes them. This guarantees running-state and file never drift, and gives one validation authority.
+
+**Example shape:**
+
+```toml
+[general]
+armed_at_boot = true
+
+[detection]
+# v1: only "usb" is implemented. This list is what makes the sensor layer pluggable.
+sensors = ["usb"]
+
+[[whitelist]]
+id = "1234:5678"
+label = "YubiKey 5C"
+max_count = 1
+
+[response]
+dry_run = false
+power_action = "poweroff"   # poweroff | halt | none
+lock_screen_first = false   # optional pre-poweroff nicety
+
+# Fenced-off option B. Absent by default. Requires explicit, unambiguous opt-in.
+# [response.luks_destroy]
+# i_understand_this_is_irreversible = true
+# target_header = "/dev/nvme0n1p3"
+```
+
+**Two non-negotiable config rules (carried directly from the review of the original):**
+
+1. **Fail-closed validation.** The daemon refuses to arm on an invalid config — malformed device ID, a `luks_destroy` target that doesn't resolve to a real LUKS device, missing required fields, or any destruction path that resolves to a system directory. A broken config disables protection loudly; it never fires blindly. This is the antidote to the original's `dirname('/etc/usbkill.ini') → /etc` disaster.
+2. **The dangerous option cannot be enabled implicitly.** `luks_destroy` requires its distinctly-named acknowledgment key *and* a typed TUI confirmation. Scaffolded in v1; header-wipe is a stub.
+
+---
+
+## 10. Packaging & installation
+
+**Artifacts:** three binaries (`killbilld`, `killbill-tui`, `killbillctl`), a `killbilld.service` systemd unit, a default config, man pages.
+
+**Build → package:**
+- `.deb` via `cargo-deb`
+- `.rpm` via `cargo-generate-rpm`
+- Arch via an AUR `PKGBUILD`
+- A plain install script as the universal fallback
+
+**`postinst` behavior:**
+- Create `/etc/killbill/` and install the default config **only if absent** (idempotent — fixes the original's broken first-run copy).
+- Create the log directory.
+- Enable the service but **do not auto-arm** until the user has configured a whitelist, so installation can never lock the user out.
+
+**systemd unit hardening** (free hardening the Python version could not express):
+- `ProtectSystem`, `ProtectHome`, `NoNewPrivileges`
+- Minimal `CapabilityBoundingSet` — only what's needed to power off and open netlink, not full ambient root.
+- Optionally `landlock` (kernel 5.13+) later, gated so the daemon runs fine without it.
+
+---
+
+## 11. Explicit non-goals for v1
+
+Naming non-goals keeps scope honest:
+
+- **No non-USB sensors.** The abstraction exists; only the USB sensor is implemented.
+- **No file shredding, no RAM/swap wiping.**
+- **No live LUKS destruction.** Scaffolded stub only.
+- **No networking, no telemetry.**
+- **No fleet or central configuration.**
+- **No non-systemd init support.**
+- **No responsibility for setting up disk encryption.** LUKS is assumed to already exist.
+
+---
+
+## 12. Lessons carried from the original (what we are deliberately fixing)
+
+Each of these was a concrete defect in the Python `usbkill`; the new architecture addresses each by design.
+
+| Original defect | How v1 prevents it |
+|---|---|
+| `dirname('/etc/usbkill.ini')` → wiping `/etc` in melt mode | Fail-closed config validation; explicit targets only; no `dirname()` of config paths; destruction is a stub. |
+| Logging failure could crash before poweroff | Logger is an independent responder; it can never block the kill path. |
+| Backgrounded RAM/swap wipe killed instantly by shutdown | No wiping in v1; response ordering is explicit and each responder's completion semantics are defined. |
+| Catchable signals silently disabled protection | Disarm is an authenticated, logged socket command; signals only stop the process. |
+| Polling missed fast USB swaps | Event-driven netlink; reacts on the kernel's own add/remove announcement. |
+| Destructive action enabled by a plain boolean | Dangerous features require distinctly-named opt-in plus typed TUI confirmation. |
+| Broken first-run config copy | Idempotent `postinst` that installs default config only if absent. |
+| `os.system` string concatenation (injection/quoting) | No shell string building; responders act via typed calls, not shelled-out concatenated commands. |
+| Python 2/3 straddling, runtime fragility | Single static Rust binary; no interpreter or module dependencies. |
+| Silent parse failure → empty device list → no protection | Sensors surface parse failures; the system fails loud, never silently to "nothing connected." |
+
+---
+
+## 13. Open decisions for the engineering team
+
+These were chosen during architecture but are reasonable to revisit. Document any change here.
+
+1. **Tokio vs. hand-rolled `mio`+threads.** Tokio is the recommended default (natural fit, good to learn) at the cost of a real dependency and concept load. A minimal-dependency alternative is acceptable if the team prefers.
+2. **JSON vs. binary wire format.** JSON chosen for readability/debuggability; swappable later without changing the protocol shape.
+3. **Daemon-owns-config-writes.** Chosen to avoid file/running-state drift; the tradeoff is the daemon needs write logic a pure editor-TUI wouldn't. Considered settled unless a strong reason emerges.
+
+---
+
+## 14. Suggested next design layers (not yet specified)
+
+The following are the natural next documents, none of which exist yet:
+
+1. Internal concurrency / data-flow diagram for the daemon (tasks, channels, event bus).
+2. Full `Sensor` and `Responder` trait contracts (method signatures, lifecycle, error semantics).
+3. Message-by-message control protocol specification (wire format, every command and event).
+4. TUI screen flows, including the plug-and-whitelist interaction and the fenced destruction screen.
+
+---
+
+## 15. Glossary
+
+- **Armed / disarmed:** Whether the daemon will act on an unauthorized event. Disarmed means detect-and-report only.
+- **Sensor:** A pluggable event source (v1: USB via netlink). Emits normalized `SensorEvent`s.
+- **Responder:** A pluggable action handler (v1: poweroff, logger; stub: luks-destroy). Independent subscriber to an `Action`.
+- **Policy engine:** The core decision stage; maps `SensorEvent` + config → `Action` or no-op.
+- **Dry-run:** A true test mode that logs what *would* happen and performs no destructive or power action.
+- **Kill path:** The sequence from kill decision to poweroff. Must never be blockable by non-essential work.
+- **LUKS header destruction:** The fenced-off "option B" data-destruction primitive; renders a LUKS disk unrecoverable by wiping the header/keyslot. Stub only in v1.
