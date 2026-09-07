@@ -1,0 +1,14 @@
+[package]
+name = "killbillctl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Command-line client for the killbill-rs daemon."
+
+[[bin]]
+name = "killbillctl"
+path = "src/main.rs"
+
+[dependencies]
+# killbill-proto and a socket/CLI stack land in step 7, when the control
+# server exists for this binary to talk to.

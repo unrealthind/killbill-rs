@@ -1,0 +1,56 @@
+# killbill-rs — example configuration
+#
+# Installed to /etc/killbill/config.toml (Phase 3 packaging installs it only if
+# absent). The daemon owns writes to the live file; `killbillctl` / the TUI
+# request changes and the daemon validates and persists them.
+#
+# Any unrecognized key is a hard error — the daemon fails closed and refuses to
+# arm rather than silently ignore a typo.
+
+[general]
+# Arm automatically when the daemon starts (e.g. at boot under systemd).
+# A fresh install ships this as false so installation can never lock you out.
+armed_at_boot = false
+
+[detection]
+# v1 implements only "usb". The list is what makes the sensor layer pluggable.
+sensors = ["usb"]
+
+# Repeat [[whitelist]] for each device that is allowed to be connected while
+# armed. `id` is the USB vendor:product pair in lowercase hex, as `lsusb` prints.
+[[whitelist]]
+id = "1050:0407"
+label = "YubiKey 5C"
+max_count = 1
+
+# [[whitelist]]
+# id = "1d6b:0002"
+# label = "Linux Foundation 2.0 root hub"
+# max_count = 6
+
+[response]
+# Dry-run: log what *would* happen and touch nothing. Use this first.
+dry_run = true
+# poweroff | halt | none
+#   poweroff — cuts power; the LUKS disk re-locks. This is the point of the tool.
+#   halt     — stops the CPU but leaves power on, so RAM keeps the LUKS master
+#              key and the disk never re-locks. Weak against the seizure threat
+#              model — use only if you know why you want it.
+#   none     — detect-and-log only; no power action at all.
+power_action = "poweroff"
+# Must be false in v1. Setting it true makes the daemon refuse to arm: a
+# pre-poweroff wait would delay the sacred kill path, and a fire-and-forget lock
+# never completes before power is cut. The LUKS re-lock already covers a seized
+# machine. (Charter §13.)
+lock_screen_first = false
+
+# ---------------------------------------------------------------------------
+# Fenced option B — LUKS header destruction. Absent by default. DELIBERATELY
+# left commented out. In v1 the responder is a STUB: it logs what it would do
+# and wipes nothing. Enabling it still requires the spelled-out acknowledgment
+# key below (there is no generic `enabled = true`), and the target must be a
+# block device under /dev/.
+# ---------------------------------------------------------------------------
+# [response.luks_destroy]
+# i_understand_this_is_irreversible = true
+# target_header = "/dev/nvme0n1p3"

@@ -1,0 +1,11 @@
+[package]
+name = "killbill-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared wire vocabulary for killbill-rs: sensor events, actions, control protocol."
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

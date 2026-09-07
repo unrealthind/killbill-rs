@@ -1,0 +1,26 @@
+# --- Assistant / Claude working files ------------------------------------
+# Intentionally NOT ignored and tracked: CLAUDE.md, PROJECT_CHARTER.md
+.claude/
+.claude-*/
+CLAUDE.local.md
+CLAUDE.*.md
+AGENTS.md
+working.md
+.aider*
+.cursor/
+.mcp.json
+*.claude.md
+
+# --- Rust ---------------------------------------------------------------
+/target/
+**/target/
+Cargo.lock.orig
+*.rs.bk
+*.pdb
+
+# --- Editor / OS -------------------------------------------------------
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/

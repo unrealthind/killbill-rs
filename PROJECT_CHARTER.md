@@ -183,7 +183,7 @@ max_count = 1
 [response]
 dry_run = false
 power_action = "poweroff"   # poweroff | halt | none
-lock_screen_first = false   # optional pre-poweroff nicety
+lock_screen_first = false   # v1: must be false; `= true` is rejected (see §13.4)
 
 # Fenced-off option B. Absent by default. Requires explicit, unambiguous opt-in.
 # [response.luks_destroy]
@@ -195,6 +195,8 @@ lock_screen_first = false   # optional pre-poweroff nicety
 
 1. **Fail-closed validation.** The daemon refuses to arm on an invalid config — malformed device ID, a `luks_destroy` target that doesn't resolve to a real LUKS device, missing required fields, or any destruction path that resolves to a system directory. A broken config disables protection loudly; it never fires blindly. This is the antidote to the original's `dirname('/etc/usbkill.ini') → /etc` disaster.
 2. **The dangerous option cannot be enabled implicitly.** `luks_destroy` requires its distinctly-named acknowledgment key *and* a typed TUI confirmation. Scaffolded in v1; header-wipe is a stub.
+
+**`lock_screen_first` in v1:** rejected at validation when set to `true` — a pre-poweroff screen lock cannot be implemented without either delaying the kill path (invariant 1) or firing-and-forgetting a lock that never completes before power is cut. `false` / absent is valid. Revisit per §13.4.
 
 ---
 
@@ -260,6 +262,7 @@ These were chosen during architecture but are reasonable to revisit. Document an
 1. **Tokio vs. hand-rolled `mio`+threads.** Tokio is the recommended default (natural fit, good to learn) at the cost of a real dependency and concept load. A minimal-dependency alternative is acceptable if the team prefers.
 2. **JSON vs. binary wire format.** JSON chosen for readability/debuggability; swappable later without changing the protocol shape.
 3. **Daemon-owns-config-writes.** Chosen to avoid file/running-state drift; the tradeoff is the daemon needs write logic a pure editor-TUI wouldn't. Considered settled unless a strong reason emerges.
+4. **`lock_screen_first`.** §9 introduced it as an "optional pre-poweroff nicety". Building it surfaced a conflict with principle 1 (the kill path is sacred): "lock *before* the power action" and "never delay the poweroff" cannot both hold — a real wait delays the kill, and a fire-and-forget lock loses the race against power being cut, so it would never actually lock. **v1 decision:** `validate` rejects `lock_screen_first = true` (fail closed, principle 2) rather than silently ignore it; `false`/absent is valid; the poweroff responder does not touch it. **If revisited:** the only kill-path-safe design is a *separate* fast responder that locks the screen the instant an unauthorized event is detected — concurrently with everything else, never awaited, independent of `power_action` — not a step sequenced before the poweroff. That is a new responder, not a poweroff-responder feature.
 
 ---
 

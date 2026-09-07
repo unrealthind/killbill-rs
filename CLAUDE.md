@@ -42,19 +42,84 @@ prevents it — consult it before changing anything in these areas.
 
 ---
 
+## How we work
+
+**Division of labour is fixed:**
+
+- **Claude writes code and guides.** It never installs toolchains or packages,
+  never runs builds, tests, the daemon, `cargo`, `rustup`, `systemctl`, or any
+  other program, and never touches real hardware. It produces source, configs,
+  docs, and step-by-step instructions.
+- **The human runs everything.** Installing the toolchain, compiling, running
+  tests, exercising the daemon, plugging/unplugging devices, and reporting
+  results back. When a step needs verification, Claude writes the exact commands
+  to paste and waits for the output.
+- This constraint also binds Claude's subagents — a review agent inspects source
+  and `git` state only; it does not build or run anything either.
+- Claude may still *read* files, search the tree, and inspect `git` history.
+
+If a task genuinely cannot progress without something being run, Claude stops and
+hands the human a precise command plus what to look for in the result.
+
+**Claude is an invisible contributor.**
+
+- No "Claude", "Claude Code", "AI-generated", or co-author trailers anywhere —
+  not in source comments, not in commit messages, not in PR/release text, not in
+  docs. The human is the sole author of record on every commit and publish.
+- Commit messages Claude drafts for the human to use carry no attribution
+  trailer and no tool branding.
+- Assistant working files are git-ignored (see `.gitignore`): the `.claude/`
+  tree, `CLAUDE.local.md`, `CLAUDE.*.md`, agent configs, MCP configs, and
+  similar. **The only tracked assistant-facing files are `CLAUDE.md` and
+  `PROJECT_CHARTER.md`** — those two are project documentation and belong in
+  history. If a new assistant file type appears, add it to `.gitignore`.
+
+## Review agents
+
+Non-trivial changes get a review pass from the relevant subagent(s) before the
+change is considered done. They live in `~/.claude/agents/`. Each is read-only
+(source + `git` inspection, no building or running) and reports findings rather
+than editing.
+
+| Agent | Owns | Invoke when a change touches… |
+|---|---|---|
+| `security-auditor` | Invariants 3, 4, 6, 8. Privilege, capabilities, socket ownership/mode, `unsafe`, untrusted-input parsing, no shell strings, no network/telemetry, dangerous opt-in naming. | responders, control socket, netlink parsing, config of destructive actions, anything with `unsafe` or syscalls |
+| `kill-path-reliability` | Invariants 1, 2, 5, 7. Kill path never blocked or chained, fail-closed on bad config, disarm-only-via-socket, sensors surface errors instead of going quiet. | policy engine, responder fan-out, arming/disarming, signal handling, sensor error paths |
+| `code-quality` | Rust idiom, the learning-codebase clarity bias, no `unwrap()`/`expect()` in runtime paths, `thiserror`/`anyhow` split, `tracing` on decisions, test coverage incl. rejection cases. | any Rust source |
+| `tui-ux` | ratatui interaction and layout, clarity of armed/disarmed state, the fenced `DESTROY` screen, keybinding sanity, terminal-resize and no-color behaviour, crash-safety of the client. | anything in `killbill-tui/` (Phase 2) |
+
+`security-auditor` and `kill-path-reliability` overlap by design — for the kill
+path and destructive config, run both.
+
+---
+
 ## Current state
 
-Pre-code. The repo contains the charter and this file; nothing is scaffolded yet.
+**Phase 1, steps 1–3 implemented** (pending the user's build/test run and the
+review-agent pass). Cargo workspace is up:
 
-**Platform note:** development is currently on macOS arm64; we move to Linux
-soon. Target is Linux-only regardless (netlink, systemd, poweroff). Write
-platform-neutral code — types, config, policy, protocol, CLI, TUI — so it
-compiles and tests anywhere, and `#[cfg(target_os = "linux")]`-gate the two
-genuinely Linux-bound pieces (the netlink sensor, the poweroff responder). Don't
-invest in elaborate macOS emulation of netlink; real verification happens on
-Linux.
+- `killbill-proto` — `SensorEvent`/`Action`/`KillReason` vocabularies, the
+  `Command`/`Reply`/`Event` control protocol, and a length-prefixed JSON frame
+  codec. `#![forbid(unsafe_code)]`.
+- `killbilld` (lib) — `config` (TOML load + fail-closed `validate` that collects
+  every error), `policy` (the pure `decide` fn + its decision table), and
+  `device_table`. `killbilld`/`killbillctl` binaries are placeholder stubs.
+- `config.example.toml` at the repo root mirrors charter §9 and is exercised by
+  a test.
 
-The Rust toolchain is not installed yet — `rustup` first.
+Steps 4–7 (responders, USB sensor, control server, `killbillctl`) are not
+started. The `decide` v1 rule set is documented at the top of
+[killbilld/src/policy.rs](killbilld/src/policy.rs).
+
+**Platform note:** development is now on Fedora Linux (the earlier macOS note is
+retired). Still write platform-neutral code — types, config, policy, protocol,
+CLI, TUI compile and test anywhere — and `#[cfg(target_os = "linux")]`-gate only
+the two genuinely Linux-bound pieces (the netlink sensor, the poweroff
+responder) with non-Linux stub fallbacks. Real netlink/poweroff verification now
+happens directly on this machine.
+
+**Toolchain:** pinned by [rust-toolchain.toml](rust-toolchain.toml) (stable +
+rustfmt + clippy). The user installs and runs it; see "How we work".
 
 ---
 
