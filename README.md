@@ -7,7 +7,7 @@
 [![Language: Rust](https://img.shields.io/badge/language-Rust_2021-orange.svg)](https://www.rust-lang.org/)
 [![Platform: Linux](https://img.shields.io/badge/platform-Linux_%2B_systemd-blue.svg)](#platform-support)
 [![License: GPL-3.0-or-later](https://img.shields.io/badge/license-GPL--3.0--or--later-green.svg)](#license)
-[![Status: Phase 1 (backend)](https://img.shields.io/badge/status-Phase_1_%E2%80%94_backend-yellow.svg)](#project-status)
+[![Status: Phase 2 (TUI)](https://img.shields.io/badge/status-Phase_2_%E2%80%94_TUI-yellow.svg)](#project-status)
 
 </div>
 
@@ -283,7 +283,7 @@ Dry-run always logs `would destroy LUKS header on /dev/…` and touches nothing.
 Three phases, strictly ordered — the backend has to be trustworthy before
 anything renders it, and it ships only once it is proven on real hardware.
 
-### Phase 1 — Backend  ·  *in progress*
+### Phase 1 — Backend  ·  ✅ **done, hardware-verified 2026-09-08**
 
 | Step | Item | State |
 |---|---|---|
@@ -296,18 +296,19 @@ anything renders it, and it ships only once it is proven on real hardware.
 | 7 | `killbillctl`: all commands | ✅ implemented |
 
 > All seven steps are code-complete, reviewed, and green on
-> `cargo test --workspace` / `clippy -D warnings`. **Phase 1 is not finished:**
-> its exit criteria are hardware criteria — a real netlink run, dry-run, systemd,
-> and a real poweroff — and none have been exercised yet. Phase 2
-> (`killbill-tui`) has begun in parallel on the `phase-2-tui` branch. See
-> [`CLAUDE.md`](CLAUDE.md) for the authoritative current state.
+> `cargo test --workspace` / `clippy -D warnings`. **All exit criteria are now
+> verified on real hardware:** a real netlink add/remove run, dry-run, a
+> `killbilld` run under systemd, and a real poweroff on an unauthorized event
+> all confirmed on 2026-09-08. See [`CLAUDE.md`](CLAUDE.md) for the full
+> results and the one packaging-relevant finding (an SELinux label gotcha for
+> Phase 3). Phase 2 (`killbill-tui`) is now the active phase.
 
 **Exit criteria:** `killbilld` runs under systemd; plug/unplug produces correct
 decisions; dry-run reports and touches nothing; `killbillctl` drives every
 command; an invalid config refuses to arm; poweroff fires for real on an
 unauthorized event.
 
-### Phase 2 — TUI
+### Phase 2 — TUI  ·  *current*
 
 `killbill-tui` on ratatui, a separate binary and a pure client of the Phase 1
 protocol. Screens: live device list, plug-and-whitelist, armed toggle, dry-run
@@ -349,7 +350,7 @@ killbill-rs/
 │   └── src/
 │       ├── lib.rs              re-exports; what the tests target
 │       ├── config.rs           TOML load + fail-closed validate (collects every error)
-│       ├── config_store.rs     atomic config write-back (the daemon owns writes)
+│       ├── config_store.rs     atomic config write-back (the daemon owns config writes)
 │       ├── policy.rs           the pure `decide` fn + decision table
 │       ├── device_table.rs     what is currently connected
 │       ├── daemon.rs           run(): the one authority thread wiring it all together

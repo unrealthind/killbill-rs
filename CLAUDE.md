@@ -127,22 +127,61 @@ Findings deliberately **deferred** — do not re-raise these as new, and do not
   below the default journal level. Device-string truncation at
   `MAX_DEVICE_STRING` is identity-lossy — acceptable because `usb_id`, not the
   serial, is what policy keys on.
+- *Future idea, not committed.* `killbilld` runs as an ordinary `SCHED_OTHER`
+  process — no real-time scheduling priority (`SCHED_FIFO`/`SCHED_RR`), no
+  `mlockall`. Invariant 1's "sacred" guarantee is a software-architecture
+  guarantee (no responder blocks another, nothing does I/O on the kill path) —
+  it is not a kernel scheduling guarantee against external interference (e.g. a
+  BadUSB HID device racing a countermanding command against `dispatch`). The
+  step 0.6 hardware test showed kernel-enumeration-to-power-cut well under a
+  second in practice, but there is no scheduling floor under that number. One
+  day: elevate the core/responder threads to `SCHED_FIFO` (plus `mlockall` to
+  remove page-fault latency) to drive the window toward **zero** lag, not
+  merely a low one. Any such change touches the sacred kill path directly and
+  needs `security-auditor` + `kill-path-reliability` sign-off — do not add ad
+  hoc.
 
-**Phase 1 is NOT done — its exit criteria are hardware criteria, and none have
-been exercised:**
+**Phase 1's hardware gate passed 2026-09-08 — every exit criterion is now
+verified on real hardware**, run directly on this machine (not yet packaged):
 
-- no real-hardware run: netlink add/remove decisions, dry-run, and a real
-  poweroff on an unauthorized event are all unverified by anyone;
-- `killbilld` under systemd is unverified;
-- one runtime check the security pass specifically asked for: with the daemon
-  running, `stat -c '%A %U %G %F' /run/killbilld.sock` must print exactly
-  `srw-rw---- root root socket`.
+- netlink add/remove decisions: confirmed correct across repeated real
+  plug/unplug cycles — an unwhitelisted add or remove fires, a whitelisted
+  *add* is suppressed, and (by design, see `policy.rs`) a whitelisted
+  *remove* still fires every time;
+- dry-run reports what would happen and touches nothing: confirmed — every
+  unwhitelisted add/remove while `dry_run = true` (and, independently,
+  `power_action = "none"`) logged the kill decision it would have taken and
+  never reached the poweroff syscall; `killbillctl test` also returned a
+  clean "nothing would fire" report for a whitelisted, connected device;
+- a real poweroff on an unauthorized event: confirmed — armed, with both
+  belts off, an unwhitelisted USB add fired `RB_POWER_OFF` immediately; the
+  machine cut power hard (no `sync`/unmount/graceful shutdown, by design),
+  corroborated by the next boot's journal ending mid-stream with no
+  shutdown-target sequence;
+- `killbilld` under systemd: confirmed — start/status/stop lifecycle correct,
+  `systemctl stop` sends only `SIGTERM` (`signal=15` in the daemon's own log,
+  systemd reports "Deactivated successfully", never `failed`), and a stop
+  neither persists nor implies disarm (restarting came back `armed: no`
+  purely because `armed_at_boot = false`, not because anything remembered a
+  prior armed state);
+- the socket permission check the security pass specifically asked for:
+  `stat -c '%A %U %G %F' /run/killbilld*.sock` printed exactly
+  `srw-rw---- root root socket`, confirmed under both a manual launch and
+  under systemd.
 
-Until those pass, do not treat Phase 1 as shippable.
+One packaging-relevant finding from this run: SELinux (`Enforcing` on this
+Fedora box) denies `init_t` (the systemd service domain) `execute` on a binary
+labeled `user_home_t` — a hand-copied binary under `/home` cannot be exec'd by
+a systemd unit (`status=203/EXEC`, confirmed via `ausearch -m avc`). Phase 3's
+`.rpm`/`.deb` install to a conventional path and should pick up a correct label
+automatically, but verify this on the packaged install rather than assuming
+it — never point a unit's `ExecStart` at a path under a user's home directory.
 
-**Phase 2 has begun in parallel** — `killbill-tui/` is a ratatui skeleton on the
-same branch, ahead of the stated phase ordering. Its known defects are the
-Phase 2 list above.
+**Phase 1 is done.** Phase 2 is now the active phase.
+
+**Phase 2 is formally underway** — `killbill-tui/` is a ratatui skeleton on the
+same branch, started before the hardware gate passed but now in correct phase
+order. Its known defects are the Phase 2 list above.
 
 Cargo workspace:
 
@@ -253,7 +292,9 @@ the hardware run.
 
 **Owed to Phase 3 (from the sign-off gate, not yet done):** `killbilld.service`
 needs `SendSIGKILL=no` or a long `TimeoutStopSec`, or systemd will `SIGKILL` a
-daemon deliberately parked on `kill_in_flight`; and `bind_listener` should refuse
+daemon deliberately parked on `kill_in_flight` (validated as necessary via a
+local test unit in the step 0.5 hardware-gate run — carry `KillSignal=SIGTERM`
++ `SendSIGKILL=no` into the packaged unit); and `bind_listener` should refuse
 to start if the socket's parent directory is group- or other-writable (socket
 mode/ownership are set by path, not fd, so a non-`/run` `--socket` in a writable
 directory is a symlink-swap window).
@@ -277,7 +318,7 @@ criteria are met; that ordering is the point — the backend has to be trustwort
 before anything renders it, and it ships only once it's been proven on real
 hardware.
 
-### Phase 1 — Backend (current)
+### Phase 1 — Backend (done — hardware-verified 2026-09-08)
 
 The daemon and the headless path. Everything the tool *is*, minus the pretty
 front end.
@@ -309,7 +350,7 @@ unplugging a device produces correct decisions; dry-run reports what would
 happen and touches nothing; `killbillctl` drives every command; an invalid
 config refuses to arm; poweroff fires for real on an unauthorized event.
 
-### Phase 2 — TUI
+### Phase 2 — TUI (current)
 
 `killbill-tui` on ratatui, a **separate binary** so a UI crash can never touch
 protection. It is a pure client of the Phase 1 protocol — if it needs a daemon

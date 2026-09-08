@@ -16,6 +16,11 @@ audit-*.md
 .mcp.json
 *.claude.md
 
+# --- Local test artifacts (Phase 2 plan step 0) --------------------------
+# Throwaway daemon configs for the Phase 1 hardware gate, never installed.
+/test-config.toml
+/test-config-live.toml
+
 # --- Rust ---------------------------------------------------------------
 /target/
 **/target/
