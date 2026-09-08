@@ -51,7 +51,7 @@ The project is also a **learning-oriented codebase**. Where a clear, teachable d
 | Language | **Rust** | Single static binary, no runtime to install, memory safety for a root daemon operating under adversarial physical access. |
 | Detection foundation | **Kernel netlink uevent socket** (`NETLINK_KOBJECT_UEVENT`) | Event-driven, millisecond reaction, near-zero idle CPU, closes the fast-swap evasion gap. Interface is ~20 years stable, so kernel version is a non-constraint. |
 | Init / supervision | **systemd** | Restart-on-crash, boot-time arming, clean status, hardening directives. Non-systemd init is out of scope for v1. |
-| Async runtime | **Tokio** (recommended) | Natural fit for "several tasks listening on channels and sockets at once." A hand-rolled `mio`+threads version is an acceptable alternative if the team wants fewer dependencies — see §13. |
+| Async runtime | **None** — `std::thread` + channels (was: Tokio recommended) | Each concurrent piece is one blocking loop (responder fan-out, netlink `recv`, control server); a thread each needs no executor. The kill path must not depend on a runtime being healthy. See §13.1 for the full rationale. |
 | Config format | **TOML** | Typed, human-editable, Rust-ecosystem default. Replaces the original's ini-with-embedded-JSON. |
 | TUI toolkit | **ratatui** | Actively maintained, mature. |
 | Control transport | **Unix domain socket**, `SOCK_SEQPACKET` | Local-only, permission-controlled, no network exposure. |
@@ -148,9 +148,11 @@ Commands: `status`, `arm`, `disarm`, `test` (dry-run), `whitelist add|remove|lis
 
 One `SOCK_SEQPACKET` Unix socket at `/run/killbilld.sock`. Three traffic types:
 
-- **Commands (client → daemon, expect reply):** `GetStatus`, `ListDevices`, `Arm`, `Disarm`, `WhitelistAdd(device_id)`, `WhitelistRemove(device_id)`, `RunDryRun`, `ReloadConfig`.
-- **Replies (daemon → client):** success/failure + payload.
-- **Event stream (daemon → client, unsolicited, to subscribers):** `DeviceAdded`, `DeviceRemoved`, `Armed`, `Disarmed`, `WouldKill(reason)` (dry-run).
+- **Commands (client → daemon, expect reply):** `GetStatus`, `ListDevices`, `Arm`, `Disarm`, `WhitelistAdd(entry)` (upsert by id), `WhitelistRemove(id)`, `WhitelistList`, `RunDryRun`, `ReloadConfig`, `Subscribe`.
+- **Replies (daemon → client):** `Ok`, `Status(payload)`, `Devices(list)`, `Whitelist(entries)`, `DryRun(reasons)`, `Error(message)`.
+- **Event stream (daemon → client, unsolicited, to subscribers):** `DeviceAdded`, `DeviceRemoved`, `Armed`, `Disarmed`, `WouldKill(reason)` (dry-run), `SensorStopped` (the USB sensor thread died — daemon is exiting non-zero for a supervisor restart), `EventsLost` (the kernel receive buffer overflowed and add/remove events were dropped).
+
+`WhitelistList` / `Reply::Whitelist` and `Reply::DryRun` were added in Phase 1 step 6 so `killbillctl whitelist list` and `killbillctl test` (§7.3) work over the protocol rather than reading the file. `StatusPayload` gained `sensor_ok` (false when the USB sensor thread has died) and `events_lost` (sticky once the sensor reports a gap). The `SensorStopped` / `EventsLost` events mirror those. When the sensor is not running, or `events_lost` is set under `on_sensor_gap = "warn"`, the daemon refuses to arm (invariant 7); under `on_sensor_gap = "kill"` a gap fires the power action (`KillReason::SensorGap`). All additive to `#[non_exhaustive]` types.
 
 **Framing:** length-prefixed messages. **Serialization:** serde + JSON for v1 (readable and debuggable for a learning codebase; swappable to a binary codec later without changing the protocol shape).
 
@@ -184,6 +186,7 @@ max_count = 1
 dry_run = false
 power_action = "poweroff"   # poweroff | halt | none
 lock_screen_first = false   # v1: must be false; `= true` is rejected (see §13.4)
+on_sensor_gap = "warn"      # warn | kill — what to do if the USB sensor drops events
 
 # Fenced-off option B. Absent by default. Requires explicit, unambiguous opt-in.
 # [response.luks_destroy]
@@ -197,6 +200,8 @@ lock_screen_first = false   # v1: must be false; `= true` is rejected (see §13.
 2. **The dangerous option cannot be enabled implicitly.** `luks_destroy` requires its distinctly-named acknowledgment key *and* a typed TUI confirmation. Scaffolded in v1; header-wipe is a stub.
 
 **`lock_screen_first` in v1:** rejected at validation when set to `true` — a pre-poweroff screen lock cannot be implemented without either delaying the kill path (invariant 1) or firing-and-forgetting a lock that never completes before power is cut. `false` / absent is valid. Revisit per §13.4.
+
+**`on_sensor_gap` (added Phase 1 step 6 review):** the netlink uevent socket has a bounded kernel receive buffer; a device storm (deliberate or not) can overflow it and the kernel then drops uevents. A dropped add/remove means the daemon's device set is no longer trustworthy — a silent blind spot, which invariant 7 forbids. `warn` (default): surface it in `killbillctl status` (`events_lost`), emit `Event::EventsLost`, and refuse to (re)arm until the daemon is restarted. `kill`: treat the gap as an unauthorized change and fire `power_action` (`KillReason::SensorGap`) — for users who would rather the machine go down than run with a gap. It fires the power action **only**, never `luks_destroy`. Absent → `warn`; an unrecognized value is a hard validation error (fail closed — the daemon never guesses intent).
 
 ---
 
@@ -259,7 +264,7 @@ Each of these was a concrete defect in the Python `usbkill`; the new architectur
 
 These were chosen during architecture but are reasonable to revisit. Document any change here.
 
-1. **Tokio vs. hand-rolled `mio`+threads.** Tokio is the recommended default (natural fit, good to learn) at the cost of a real dependency and concept load. A minimal-dependency alternative is acceptable if the team prefers.
+1. **Tokio vs. hand-rolled `mio`+threads.** Tokio is the recommended default (natural fit, good to learn) at the cost of a real dependency and concept load. A minimal-dependency alternative is acceptable if the team prefers. **v1 decision (steps 4–5):** neither Tokio *nor* `mio` — the daemon runs on plain `std::thread` + `std::sync::mpsc` channels throughout. The kill path (invariant 1 / principle 1) must not depend on an async runtime being healthy and schedulable, and every concurrent piece here is a single blocking loop (responder fan-out, the netlink `recv` loop, and the step-6 control server): a thread each, no executor, no `mio` reactor. Fewer dependencies for a root daemon, one concurrency model end to end. Revisit only if a future sensor or responder genuinely needs many-tasks-on-one-thread multiplexing.
 2. **JSON vs. binary wire format.** JSON chosen for readability/debuggability; swappable later without changing the protocol shape.
 3. **Daemon-owns-config-writes.** Chosen to avoid file/running-state drift; the tradeoff is the daemon needs write logic a pure editor-TUI wouldn't. Considered settled unless a strong reason emerges.
 4. **`lock_screen_first`.** §9 introduced it as an "optional pre-poweroff nicety". Building it surfaced a conflict with principle 1 (the kill path is sacred): "lock *before* the power action" and "never delay the poweroff" cannot both hold — a real wait delays the kill, and a fire-and-forget lock loses the race against power being cut, so it would never actually lock. **v1 decision:** `validate` rejects `lock_screen_first = true` (fail closed, principle 2) rather than silently ignore it; `false`/absent is valid; the poweroff responder does not touch it. **If revisited:** the only kill-path-safe design is a *separate* fast responder that locks the screen the instant an unauthorized event is detected — concurrently with everything else, never awaited, independent of `power_action` — not a step sequenced before the poweroff. That is a new responder, not a poweroff-responder feature.

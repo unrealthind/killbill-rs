@@ -95,21 +95,168 @@ path and destructive config, run both.
 
 ## Current state
 
-**Phase 1, steps 1–3 implemented** (pending the user's build/test run and the
-review-agent pass). Cargo workspace is up:
+**Phase 1 steps 1–7 are committed and code-complete.** Steps 1–4 landed in
+`c5ec882`; steps 5–7 (USB sensor, control server, `killbillctl`) landed on the
+`phase-2-tui` branch after a full read-only audit and three rounds of fixes.
+
+**The review gate is green.** `security-auditor`, `kill-path-reliability` and
+`code-quality` were each run against the final tree as a sign-off gate (not a
+delta review) and all three returned PASS. `cargo fmt`/`clippy -D warnings`/
+`cargo test --workspace` are clean (161 tests).
+
+Findings deliberately **deferred** — do not re-raise these as new, and do not
+"fix" them without reading why they were left:
+
+- *Phase 2 (TUI).* `killbill-tui/src/ui/devices.rs` renders `label`/`serial`
+  through `Span::raw` without `sanitize_device_string`. Inert today (the parser
+  sanitizes at source and `label` is always `None` in v1) but it is the one
+  consumer that does not re-sanitize. Its `client.rs` also reuses one command
+  connection while the daemon closes after a single reply — every second command
+  fails — and has no socket timeouts, no `config_stale` in the status band, and a
+  stale armed-state cache on disconnect. Its `MAX_MSG` (128 KiB) claims in a
+  comment to mirror `killbillctl` (64 KiB); it does not.
+- *Phase 2 (protocol).* An armed **dry-run** kill broadcasts nothing to
+  subscribers, so a client watching a dry-run daemon sees a device appear and
+  then silence. Needs a protocol-visible event.
+- *Phase 3.* `killbilld.service` needs `SendSIGKILL=no` (or a long
+  `TimeoutStopSec`) or systemd will kill a daemon deliberately parked on
+  `kill_in_flight`. And `bind_listener` should refuse to start when the socket's
+  parent directory is group- or other-writable: mode and ownership are set by
+  path, not fd, so a non-`/run` `--socket` there is a symlink-swap window.
+- *Noted, not fixed.* An allowed device event while armed logs at `debug!`,
+  below the default journal level. Device-string truncation at
+  `MAX_DEVICE_STRING` is identity-lossy — acceptable because `usb_id`, not the
+  serial, is what policy keys on.
+
+**Phase 1 is NOT done — its exit criteria are hardware criteria, and none have
+been exercised:**
+
+- no real-hardware run: netlink add/remove decisions, dry-run, and a real
+  poweroff on an unauthorized event are all unverified by anyone;
+- `killbilld` under systemd is unverified;
+- one runtime check the security pass specifically asked for: with the daemon
+  running, `stat -c '%A %U %G %F' /run/killbilld.sock` must print exactly
+  `srw-rw---- root root socket`.
+
+Until those pass, do not treat Phase 1 as shippable.
+
+**Phase 2 has begun in parallel** — `killbill-tui/` is a ratatui skeleton on the
+same branch, ahead of the stated phase ordering. Its known defects are the
+Phase 2 list above.
+
+Cargo workspace:
 
 - `killbill-proto` — `SensorEvent`/`Action`/`KillReason` vocabularies, the
   `Command`/`Reply`/`Event` control protocol, and a length-prefixed JSON frame
   codec. `#![forbid(unsafe_code)]`.
 - `killbilld` (lib) — `config` (TOML load + fail-closed `validate` that collects
-  every error), `policy` (the pure `decide` fn + its decision table), and
-  `device_table`. `killbilld`/`killbillctl` binaries are placeholder stubs.
+  every error; rejects `lock_screen_first = true`, see charter §13.4), `policy`
+  (the pure `decide` fn + its decision table), `device_table`, and `responder`
+  (`Responder` trait, thread-per-responder `dispatch` with inline+panic-caught
+  spawn-failure fallback, `preflight` arm-time capability check, `logger`,
+  `poweroff` via `nix::sys::reboot`, `luks-destroy` logging stub).
+  `#![deny(unsafe_code)]`. `killbilld`/`killbillctl` binaries are real (steps
+  6–7), not stubs.
+- `sensor` (step 5) — `Sensor` trait (Seam 1) + `spawn`/`SensorHandle` thread
+  wrapper + `StopFlag`; the trait emits a `SensorMessage` stream (`Started` once
+  the source is open, then `Event` / `EventsLost`). `sensor::uevent` is a
+  crate-private pure `parse_uevent(&[u8]) -> Result<Option<SensorEvent>, _>`
+  (mirrors `policy::decide`), exhaustively tested against captured-shape byte
+  payloads; `UsbNetlinkSensor` opens `NETLINK_KOBJECT_UEVENT` group 1 via `nix`
+  (no `unsafe`, **no capability** — `NL_CFG_F_NONROOT_RECV`; `CAP_NET_ADMIN`
+  must NOT be granted, it would allow forging uevents), `recvfrom` + drop any
+  datagram whose source `pid != 0`, `SO_RCVBUF` bump; `#[cfg(target_os =
+  "linux")]` with a refuse-to-arm stub elsewhere. Fails loud (invariant 7):
+  parse errors log + keep listening, a USB device with no readable id emits
+  `usb_id: None` so policy fails closed, a dead socket ends `run` with `Err`,
+  a receive-buffer overflow (`ENOBUFS`) surfaces as `EventsLost`.
+- `config_store` (step 6) — `RawConfig` gained `Serialize`; atomic write-back
+  (temp `create_new` at 0600 / existing mode preserved, `fsync`, `rename`, dir
+  `fsync`) since the daemon owns config writes (charter §9).
+- `control` (step 6, `#[cfg(unix)]`) — `SOCK_SEQPACKET` server at
+  `/run/killbilld.sock`, root-owned, mode 0660 set **before** `listen`, `umask`
+  around `bind`, `is_socket()`-guarded unlink + a `connect()` probe: a leftover
+  socket is unlinked only on `ECONNREFUSED` (nothing listening) — a live daemon
+  or any probe error it can't classify aborts startup (fail closed). The
+  listener is bound by `control::bind_listener` on the daemon's main thread
+  *before* the core loop starts, so a bind failure is fatal, never a run with no
+  control socket (invariant 5). Thread per connection; each reads the peer's
+  `SO_PEERCRED`, turns its request into a `ControlRequest`, and hands it to the
+  core — connection threads never touch state. Privileged commands
+  (`Arm`/`Disarm`/`Whitelist*`/`ReloadConfig`/`RunDryRun`) require `uid 0`.
+- `daemon` (step 6, `#[cfg(unix)]`) — `run()` wires sensor → core → responders +
+  control server + a dedicated `config-writer` thread + a `signal-hook` thread.
+  **One authority thread** owns all mutable state (`Core`): sensor events and
+  control requests arrive on one channel, handled serially, no locks. `dispatch`
+  is called inline on that thread (the responder contract is trivially
+  satisfied). **All config file I/O is off-loaded to the `config-writer` thread**
+  so `fsync` never sits on the kill path (`Core` validates + swaps in memory
+  only). Invalid config → runs but won't arm; dead sensor → `sensor_ok=false`
+  (it starts `false`), `Event::SensorStopped`, process exits non-zero for a
+  supervisor restart, armed state untouched (only `Disarm` disarms — invariant
+  5); sensor *restart* → also a gap: sets sticky `events_lost` + clears any
+  pending boot arm, so the daemon won't re-arm across a restart without an
+  operator restart; events lost → sticky `events_lost`, `on_sensor_gap` decides
+  warn-vs-kill; a synthetic (`SYNTH_UUID`) *add* is recorded-not-acted, a
+  synthetic *remove* still fires — nothing re-announces a device that is gone,
+  and an unplug is the event this tool exists to catch; kill in flight at
+  shutdown or on panic → process parks, never exits.
+  **Every gap notification goes through `Core::maybe_dispatch_gap_kill`**, which
+  runs kill-path-first and *above* the sticky-`events_lost` early return (so a
+  gap seen under `warn`, or while disarmed, cannot poison a later one that does
+  warrant a kill), latched against a notification burst, and the latch is cleared
+  on any config swap so a post-gap `reload` re-enables it. `on_sensor_event`
+  dispatches immediately after `policy::decide` — the device-table update
+  allocates and is deliberately sequenced *after* it. The shutdown drain routes
+  **every** sensor variant, not just device events: a queued `SensorRestarting`
+  or `SensorEnded` is a gap, and a signal must never be a way to skip a pending
+  kill (invariant 5).
+- `killbilld` bin — `main.rs`: two flags (`--config`, `--socket`), a
+  `tracing-appender` non-blocking stderr sink, hand off to `daemon::run`.
+- `killbillctl` (step 7) — `clap` subcommands (`status`, `devices`, `arm`,
+  `disarm`, `test`, `reload`, `whitelist list|add|remove`, `events`); a pure
+  protocol client over the SEQPACKET socket. `#![forbid(unsafe_code)]`.
+- Protocol additions (all additive to `#[non_exhaustive]` types, charter §8
+  updated): `Command::WhitelistList`, `Reply::Whitelist`, `Reply::DryRun`,
+  `Event::SensorStopped`, `Event::EventsLost`, `StatusPayload.sensor_ok` +
+  `StatusPayload.events_lost` (both `#[serde(default)]`), `KillReason::SensorGap`,
+  `sanitize_device_string` (one shared copy for every wire end; also applied in
+  `sensor::uevent` so `serial` is safe before it enters a `SensorEvent`). It is
+  an **allowlist** — printable ASCII plus space, everything else → U+FFFD, capped
+  at `MAX_DEVICE_STRING`. A denylist was tried and rejected: enumerating hostile
+  codepoints (C0/C1, Trojan-Source bidi, zero-width, tag chars, variation
+  selectors, combining-mark stacking) cannot be completed, and missing one is a
+  silent hole. Do not "fix" this back into a denylist.
+  One frame-size limit — `MAX_CONTROL_FRAME` (64 KiB) is the whole-frame ceiling
+  every reader allocates; `encode`/`decode` bound the JSON body by `MAX_BODY_LEN`
+  (`= MAX_CONTROL_FRAME - 4`) so nothing encodable is unreadable. An unsendable
+  reply comes back as `Reply::Error`, not a dropped frame.
+- Config addition: `response.on_sensor_gap = "warn" | "kill"` (default `warn`),
+  parsed to `config::SensorGapAction`.
 - `config.example.toml` at the repo root mirrors charter §9 and is exercised by
   a test.
 
-Steps 4–7 (responders, USB sensor, control server, `killbillctl`) are not
-started. The `decide` v1 rule set is documented at the top of
-[killbilld/src/policy.rs](killbilld/src/policy.rs).
+The `decide` v1 rule set is documented at the top of
+[killbilld/src/policy.rs](killbilld/src/policy.rs); the kill-path contracts the
+sensor/server wiring must honour are at the top of
+[killbilld/src/responder/mod.rs](killbilld/src/responder/mod.rs) (core logs the
+decision *after* `dispatch`; shutdown honours `kill_in_flight`; arm calls
+`preflight`; `Action` is never queued).
+
+**Not built for v1 (owed to Phase 2):** startup sysfs enumeration of already-
+connected USB devices — `ListDevices` / `test` currently see only devices added
+since the daemon started. Config comments are lost on daemon-side writes.
+
+**Open:** the policy `DeviceTable` pre-event `+1` convention (keep vs flip to
+post-event) is still undecided — it did not block steps 5–7 and does not block
+the hardware run.
+
+**Owed to Phase 3 (from the sign-off gate, not yet done):** `killbilld.service`
+needs `SendSIGKILL=no` or a long `TimeoutStopSec`, or systemd will `SIGKILL` a
+daemon deliberately parked on `kill_in_flight`; and `bind_listener` should refuse
+to start if the socket's parent directory is group- or other-writable (socket
+mode/ownership are set by path, not fd, so a non-`/run` `--socket` in a writable
+directory is a symlink-swap window).
 
 **Platform note:** development is now on Fedora Linux (the earlier macOS note is
 retired). Still write platform-neutral code — types, config, policy, protocol,
@@ -238,9 +385,9 @@ process. Adjust the layout if it stops fitting — just note the change here.
 
 ## Conventions
 
-- **Rust 2021+, stable toolchain.** Tokio is the recommended async runtime
-  (charter §13.1 leaves `mio`+threads open — if that's chosen instead, record it
-  in the charter).
+- **Rust 2021+, stable toolchain.** No async runtime: the daemon is `std::thread`
+  + `std::sync::mpsc` throughout (charter §13.1 — recorded there). Each concurrent
+  piece is one blocking loop; the kill path must not depend on an executor.
 - **`unsafe` needs a comment** stating the invariant it upholds. Expect it only
   around netlink socket setup and the poweroff syscall.
 - **No `unwrap()`/`expect()` in daemon runtime paths.** Startup and tests are

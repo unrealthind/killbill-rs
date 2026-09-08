@@ -1,20 +1,21 @@
 [package]
-name = "killbillctl"
+name = "killbill-tui"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Command-line client for the killbill-rs daemon."
+description = "Terminal UI client for the killbill-rs daemon."
 
 [[bin]]
-name = "killbillctl"
+name = "killbill-tui"
 path = "src/main.rs"
 
 [dependencies]
 killbill-proto = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
+ratatui = { workspace = true }
 
 # The control socket is AF_UNIX / SOCK_SEQPACKET (charter §8); `nix` gives the
-# safe wrappers for it. `killbillctl` is a Unix tool.
+# safe wrappers for it, exactly as `killbillctl` uses them. Unix-only tool.
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true }

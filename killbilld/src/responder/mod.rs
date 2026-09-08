@@ -66,6 +66,10 @@ pub(crate) use poweroff::PoweroffResponder;
 /// power action (not a dry run, not `power_action = "none"`), and never cleared.
 static KILL_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 
+/// Set by the poweroff responder when `reboot(2)` **and** every last-resort
+/// fallback have failed and the machine is still up. See [`kill_failed`].
+static KILL_FAILED: AtomicBool = AtomicBool::new(false);
+
 /// `true` once a real kill has been dispatched. The signal-driven shutdown path
 /// must not let the process exit while this holds — doing so would destroy the
 /// detached poweroff thread before it reaches `reboot(2)` (invariant 5). Since
@@ -75,6 +79,22 @@ static KILL_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 #[must_use]
 pub fn kill_in_flight() -> bool {
     KILL_IN_FLIGHT.load(Ordering::SeqCst)
+}
+
+/// `true` once the poweroff responder has exhausted `reboot(2)` and every
+/// fallback (SysRq, halt) with the machine still up. The park-forever sites —
+/// [`crate::daemon`] shutdown and the `main.rs` panic guard — stop parking when
+/// this is set and let the process exit non-zero instead: a daemon that cannot
+/// power the machine off should be restartable by its supervisor, not a
+/// signal-immune zombie that protects nothing.
+#[must_use]
+pub fn kill_failed() -> bool {
+    KILL_FAILED.load(Ordering::SeqCst)
+}
+
+/// Called by the poweroff responder's terminal failure branch, before it logs.
+pub(crate) fn mark_kill_failed() {
+    KILL_FAILED.store(true, Ordering::SeqCst);
 }
 
 /// A single, independent reaction to a kill [`Action`].

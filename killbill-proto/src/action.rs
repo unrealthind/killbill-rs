@@ -56,6 +56,11 @@ pub enum KillReason {
     WhitelistedDeviceRemoved { id: UsbId },
     /// Any other device was disconnected (`id` absent if it had no readable id).
     DeviceRemoved { id: Option<UsbId> },
+    /// The USB sensor lost events (kernel receive-buffer overflow) and can no
+    /// longer account for the device set. Fired only when
+    /// `response.on_sensor_gap = "kill"`; the default (`"warn"`) surfaces it in
+    /// `status` instead. Not a device event — there is no `id`.
+    SensorGap,
 }
 
 impl std::fmt::Display for KillReason {
@@ -78,6 +83,9 @@ impl std::fmt::Display for KillReason {
             KillReason::DeviceRemoved { id: None } => {
                 f.write_str("an unidentified device was disconnected")
             }
+            KillReason::SensorGap => f.write_str(
+                "the USB sensor lost events and can no longer account for the device set",
+            ),
         }
     }
 }

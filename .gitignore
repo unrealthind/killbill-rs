@@ -6,6 +6,11 @@ CLAUDE.local.md
 CLAUDE.*.md
 AGENTS.md
 working.md
+# Review/audit write-ups are working notes, not project documentation. What
+# they conclude belongs in CLAUDE.md's "Current state"; the report itself does
+# not go into history.
+AUDIT-*.md
+audit-*.md
 .aider*
 .cursor/
 .mcp.json

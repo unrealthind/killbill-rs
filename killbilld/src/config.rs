@@ -15,7 +15,7 @@
 use std::path::{Path, PathBuf};
 
 use killbill_proto::{PowerAction, UsbId};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
 // Raw form (the file as written)
@@ -23,7 +23,11 @@ use serde::Deserialize;
 
 /// The configuration file before validation. `deny_unknown_fields` everywhere:
 /// a typo'd key is a hard error, not a silently-ignored setting.
-#[derive(Debug, Clone, Default, Deserialize)]
+///
+/// Also `Serialize`: the daemon owns config writes (charter §9), so it round-
+/// trips this back to TOML through [`crate::config_store`]. Comments and layout
+/// in the file are not preserved across a daemon-side write.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RawConfig {
     #[serde(default)]
@@ -36,14 +40,14 @@ pub struct RawConfig {
     pub response: RawResponse,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RawGeneral {
     #[serde(default)]
     pub armed_at_boot: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RawDetection {
     #[serde(default = "default_sensors")]
@@ -62,41 +66,46 @@ fn default_sensors() -> Vec<String> {
     vec!["usb".to_owned()]
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RawWhitelistEntry {
     pub id: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_count: Option<u32>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RawResponse {
     #[serde(default)]
     pub dry_run: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub power_action: Option<String>,
     /// Charter §9 knob. v1 rejects `= true` in [`validate`] — see
     /// [`ConfigError::LockScreenFirstUnsupported`]. Kept here so the rejection
     /// can be specific rather than a `deny_unknown_fields` "unknown key".
     #[serde(default)]
     pub lock_screen_first: bool,
+    /// What to do if the USB sensor reports lost events (kernel receive-buffer
+    /// overflow): `"warn"` (default — surface in `status`, keep running) or
+    /// `"kill"` (treat the gap as an unauthorized change and fire).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_sensor_gap: Option<String>,
     /// Absent from the default config entirely. Its mere presence means the
     /// operator is asking for LUKS header destruction, which then must be
     /// acknowledged and targeted correctly or the whole config is rejected.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub luks_destroy: Option<RawLuksDestroy>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RawLuksDestroy {
     #[serde(default)]
     pub i_understand_this_is_irreversible: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_header: Option<String>,
 }
 
@@ -119,12 +128,28 @@ pub struct Config {
     pub whitelist: Vec<WhitelistRule>,
     pub dry_run: bool,
     pub power_action: PowerAction,
+    /// Resolved from `response.on_sensor_gap`; defaults to [`SensorGapAction::Warn`].
+    pub on_sensor_gap: SensorGapAction,
     // `response.lock_screen_first` is intentionally absent: v1 rejects `= true`
     // at validation (see [`ConfigError::LockScreenFirstUnsupported`]) and `false`
     // carries no information. A real implementation re-adds it.
     /// `Some` only if `[response.luks_destroy]` was present *and* fully valid
     /// *and* acknowledged. `None` is the normal case.
     pub luks_destroy: Option<LuksDestroy>,
+}
+
+/// What the daemon does when the USB sensor reports a kernel receive-buffer
+/// overflow (`ENOBUFS`) — some add/remove events were missed. A closed set, so a
+/// plain enum: a new variant is a deliberate schema change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SensorGapAction {
+    /// Set `events_lost` in `status`, log loudly, keep running. The operator
+    /// investigates and restarts.
+    #[default]
+    Warn,
+    /// Treat the gap as an unauthorized change: fire a kill
+    /// ([`killbill_proto::KillReason::SensorGap`]).
+    Kill,
 }
 
 /// A sensor the daemon should start. v1 has exactly one.
@@ -147,8 +172,10 @@ pub struct WhitelistRule {
 ///
 /// There is no `enabled` field: a `LuksDestroy` value existing *is* the
 /// acknowledgment. In v1 the responder that consumes this only logs — the wipe
-/// is a stub (invariant 3). Whether `target_header` really resolves to a LUKS
-/// device is checked at arm time on Linux, not here (see [`validate`]).
+/// is a stub (invariant 3). [`validate`] checks the path shape (absolute,
+/// control-char-free, under `/dev/`); the arm-time `preflight` in
+/// [`crate::responder`] checks the target actually exists and is a block device
+/// (a real LUKS-header probe waits for Phase 3, with the wipe).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LuksDestroy {
     pub target_header: PathBuf,
@@ -198,6 +225,9 @@ pub enum ConfigError {
 
     #[error("response.power_action {value:?} is not one of poweroff, halt, none")]
     BadPowerAction { value: String },
+
+    #[error("response.on_sensor_gap {value:?} is not one of warn, kill")]
+    BadSensorGapAction { value: String },
 
     #[error(
         "response.lock_screen_first = true is not supported in v1: a pre-poweroff wait \
@@ -285,6 +315,7 @@ pub fn validate(raw: RawConfig) -> Result<Config, ValidationReport> {
     let sensors = validate_sensors(&raw.detection.sensors, &mut errors);
     let whitelist = validate_whitelist(&raw.whitelist, &mut errors);
     let power_action = validate_power_action(raw.response.power_action.as_deref(), &mut errors);
+    let on_sensor_gap = validate_sensor_gap(raw.response.on_sensor_gap.as_deref(), &mut errors);
     let luks_destroy = validate_luks_destroy(raw.response.luks_destroy.as_ref(), &mut errors);
 
     // v1 cannot honour a pre-poweroff screen lock without touching the kill
@@ -301,6 +332,7 @@ pub fn validate(raw: RawConfig) -> Result<Config, ValidationReport> {
             whitelist,
             dry_run: raw.response.dry_run,
             power_action,
+            on_sensor_gap,
             luks_destroy,
         })
     } else {
@@ -373,6 +405,20 @@ fn validate_power_action(value: Option<&str>, errors: &mut Vec<ConfigError>) -> 
             });
             // Placeholder; `errors` is non-empty so `validate` returns Err.
             PowerAction::PowerOff
+        }
+    }
+}
+
+fn validate_sensor_gap(value: Option<&str>, errors: &mut Vec<ConfigError>) -> SensorGapAction {
+    match value {
+        None | Some("warn") => SensorGapAction::Warn,
+        Some("kill") => SensorGapAction::Kill,
+        Some(other) => {
+            errors.push(ConfigError::BadSensorGapAction {
+                value: other.to_owned(),
+            });
+            // Placeholder; `errors` is non-empty so `validate` returns Err.
+            SensorGapAction::Warn
         }
     }
 }
@@ -631,6 +677,23 @@ mod tests {
         )
         .iter()
         .any(|e| matches!(e, ConfigError::BadPowerAction { value } if value == "explode")));
+    }
+
+    #[test]
+    fn on_sensor_gap_defaults_to_warn_and_accepts_kill() {
+        assert_eq!(
+            validate(RawConfig::default()).unwrap().on_sensor_gap,
+            SensorGapAction::Warn
+        );
+        let cfg = validate(parse("[response]\non_sensor_gap = \"kill\"\n")).unwrap();
+        assert_eq!(cfg.on_sensor_gap, SensorGapAction::Kill);
+    }
+
+    #[test]
+    fn bad_on_sensor_gap_is_rejected() {
+        assert!(errs("[response]\non_sensor_gap = \"maybe\"\n")
+            .iter()
+            .any(|e| matches!(e, ConfigError::BadSensorGapAction { value } if value == "maybe")));
     }
 
     #[test]

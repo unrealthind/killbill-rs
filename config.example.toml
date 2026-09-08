@@ -15,6 +15,10 @@ armed_at_boot = false
 [detection]
 # v1 implements only "usb". The list is what makes the sensor layer pluggable.
 sensors = ["usb"]
+# Note: while armed, `udevadm trigger --action=remove` (or any root-issued
+# synthetic removal uevent) fires the power action for the affected device, just
+# like a physical unplug. A synthetic *add* re-announcing an already-connected
+# device is recorded but never acted on.
 
 # Repeat [[whitelist]] for each device that is allowed to be connected while
 # armed. `id` is the USB vendor:product pair in lowercase hex, as `lsusb` prints.
@@ -43,6 +47,16 @@ power_action = "poweroff"
 # never completes before power is cut. The LUKS re-lock already covers a seized
 # machine. (Charter §13.)
 lock_screen_first = false
+# What to do if the USB sensor loses events (receive-buffer overflow, an
+# unparseable datagram, or the sensor thread crashing) — e.g. a device storm
+# meant to bury a real add/remove:
+#   warn — surface it in `killbillctl status` (events_lost) and refuse to (re)arm
+#          until the daemon is restarted. The default.
+#   kill — treat the gap as an unauthorized change and fire `power_action`.
+#          A gap fires the power action ONLY — it never triggers luks_destroy,
+#          even when that is configured (header destruction is reserved for an
+#          actual identified device event).
+on_sensor_gap = "warn"
 
 # ---------------------------------------------------------------------------
 # Fenced option B — LUKS header destruction. Absent by default. DELIBERATELY
