@@ -2,15 +2,27 @@
 resolver = "2"
 members = ["killbill-proto", "killbilld", "killbillctl", "killbill-tui"]
 
-# Phase 3 adds packaging; it does not exist yet.
+# Packaging (Phase 3): the `.deb` / `.rpm` metadata lives in `killbilld/Cargo.toml`
+# ([package.metadata.deb] and [package.metadata.generate-rpm]); the systemd unit,
+# maintainer scripts, man pages and install script are under `packaging/`.
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+# MSRV — the toolchain the release is cut with (rustc 1.98.1, 2026-09-01). CI
+# has a job that builds on exactly this version so the claim stays honest.
+rust-version = "1.98"
 license = "GPL-3.0-or-later"
+authors = ["unrealthind <unrealthind@users.noreply.github.com>"]
+repository = "https://github.com/unrealthind/killbill-rs"
+homepage = "https://github.com/unrealthind/killbill-rs"
+readme = "README.md"
+description = "Event-driven USB-kill daemon: powers the machine off on an unauthorized USB change while armed, so a LUKS disk re-locks."
+keywords = ["security", "usb", "luks", "systemd", "anti-forensics"]
+categories = ["command-line-utilities", "os::linux-apis"]
 
 [workspace.dependencies]
-killbill-proto = { path = "killbill-proto" }
+killbill-proto = { path = "killbill-proto", version = "0.1.0" }
 
 # Shared third-party versions. The daemon runs on `std::thread` + channels
 # throughout (sensor, responders, control server) — no async runtime; see
@@ -55,6 +67,8 @@ nix = { version = "0.29", features = ["reboot", "socket", "user", "fs"] }
 signal-hook = "0.3"
 
 [profile.release]
+# Strip symbols from the packaged binaries. Not a correctness knob.
+strip = "symbols"
 # NOT a size knob — do not switch to "abort". Responders run on independent
 # threads and a panic in one (logger, luks-destroy) must unwind only that
 # thread, never abort the process and take an in-flight poweroff with it
