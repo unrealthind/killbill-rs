@@ -10,6 +10,7 @@
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -225,6 +226,15 @@ fn config(socket: &Path, action: &ConfigCmd) -> Result<()> {
                 request(socket, &Command::ConfigSet(change))?,
                 "config updated",
             )?;
+            // The other four fields take effect immediately. `sensors` is
+            // wired once at daemon start, so the daemon persists the change
+            // but keeps watching the old set until it restarts.
+            if matches!(field, SetField::Sensors { .. }) {
+                eprintln!(
+                    "note: the sensor set is applied at daemon start — restart the daemon \
+                     (e.g. `systemctl restart killbilld`) for this to take effect"
+                );
+            }
         }
     }
     Ok(())
@@ -323,6 +333,13 @@ fn request(socket: &Path, cmd: &Command) -> Result<Reply> {
     Ok(reply)
 }
 
+/// How long a no-`--follow` `events` drain waits for the next frame before it
+/// decides the backlog is fully delivered and stops. The daemon writes the
+/// whole backlog immediately after the ack, so a gap this long means "nothing
+/// more was queued" — but see the note printed on that exit: a daemon busy
+/// servicing a kill decision could still have the write in flight.
+const BACKLOG_WINDOW: Duration = Duration::from_millis(200);
+
 /// Subscribe, print the backlog the daemon replays first, then either return
 /// (plain `events`) or keep printing live events until interrupted
 /// (`events --follow`). Backlog and live events are both `StreamEvent` frames
@@ -355,7 +372,7 @@ fn stream_events(socket: &Path, follow: bool) -> Result<()> {
         // Only drain what the daemon already had queued for us (the backlog),
         // don't sit waiting for the next live event.
         stream
-            .set_read_timeout(Some(std::time::Duration::from_millis(200)))
+            .set_read_timeout(Some(BACKLOG_WINDOW))
             .context("setting a read timeout")?;
     }
 
@@ -363,7 +380,18 @@ fn stream_events(socket: &Path, follow: bool) -> Result<()> {
         let n = match stream.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => n,
-            Err(e) if !follow && is_timeout(&e) => break,
+            Err(e) if !follow && is_timeout(&e) => {
+                // Stopped on the timeout, not a clean EOF: if the daemon was
+                // busy (e.g. servicing a kill decision on the same socket) its
+                // backlog write may not have finished. Say so — a silently
+                // short list is worse than a noisy complete one.
+                eprintln!(
+                    "note: stopped after the {}ms backlog window; if the daemon was busy some \
+                     earlier events may not be shown. Use --follow to keep streaming.",
+                    BACKLOG_WINDOW.as_millis()
+                );
+                break;
+            }
             Err(e) => return Err(e).context("reading an event"),
         };
         let (se, _) = decode::<StreamEvent>(&buf[..n])?;
