@@ -22,10 +22,13 @@ sensors = ["usb"]
 
 # Repeat [[whitelist]] for each device that is allowed to be connected while
 # armed. `id` is the USB vendor:product pair in lowercase hex, as `lsusb` prints.
-[[whitelist]]
-id = "1050:0407"
-label = "YubiKey 5C"
-max_count = 1
+# Ships empty on purpose: until you add your own devices, arming allows nothing
+# (every connected device reads as unknown). Uncomment and edit these, or add
+# devices from the TUI / `killbillctl whitelist add`.
+# [[whitelist]]
+# id = "1050:0407"
+# label = "YubiKey 5C"
+# max_count = 1
 
 # [[whitelist]]
 # id = "1d6b:0002"

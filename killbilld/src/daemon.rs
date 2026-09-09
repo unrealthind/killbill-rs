@@ -51,9 +51,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use killbill_proto::{
-    rfc3339_now, Action, Command, ConfigChange, ConfigPayload, DeviceIdentity, DeviceInfo, Event,
-    EventKind, KillReason, LuksDestroyInfo, OnSensorGap, PowerAction, Reply, SensorEvent,
-    SensorSource, StatusPayload, StreamEvent, UsbId, WhitelistEntry,
+    cap_report, rfc3339_now, sanitize_report, Action, Command, ConfigChange, ConfigPayload,
+    DeviceIdentity, DeviceInfo, Event, EventKind, KillReason, LuksDestroyInfo, OnSensorGap,
+    PowerAction, Reply, SensorEvent, SensorSource, StatusPayload, StreamEvent, UsbId,
+    WhitelistEntry,
 };
 
 use crate::config::{self, Config, RawConfig, RawWhitelistEntry, SensorGapAction, SensorName};
@@ -241,17 +242,15 @@ pub fn run(opts: RunOptions) -> anyhow::Result<()> {
 
     // --- core state ----------------------------------------------------
     let mut core = Core::load(&opts.config_path, write_tx);
-    match &core.config_error {
-        Some(err) => tracing::error!(
-            "configuration is INVALID — the daemon is running but WILL NOT ARM until it is \
-             fixed and reloaded (invariant 2):\n{err}"
-        ),
-        None => tracing::info!(
+    // `Core::load` already logs the full "configuration is INVALID" report on the
+    // error path; only the healthy-load line is left to emit here.
+    if core.config_error.is_none() {
+        tracing::info!(
             whitelist = core.config.whitelist.len(),
             dry_run = core.config.dry_run,
             power_action = %core.config.power_action,
             "configuration loaded"
-        ),
+        );
     }
 
     // --- startup settling ---------------------------------------------------
@@ -543,6 +542,7 @@ fn handle_msg(core: &mut Core, msg: Msg) -> ControlFlow<Outcome> {
         Msg::Control(ControlRequest::Subscribe { peer, events, ack }) => {
             core.subscribe(peer, events, ack);
         }
+        Msg::Control(ControlRequest::Unsubscribe { id }) => core.unsubscribe(id),
         Msg::ConfigWritten {
             raw,
             config,
@@ -625,6 +625,9 @@ fn spawn_signal_thread(msg_tx: Sender<Msg>) -> anyhow::Result<()> {
 /// A subscribed control connection's event channel, plus a miss counter so a
 /// client that stops reading is eventually dropped rather than leaking a thread.
 struct Subscriber {
+    /// Identifies this subscriber for [`Core::unsubscribe`] when its connection
+    /// thread sees the peer close.
+    id: u64,
     tx: SyncSender<StreamEvent>,
     consecutive_misses: u32,
 }
@@ -646,6 +649,9 @@ struct Core {
     devices: DeviceTracker,
     responders: Vec<Arc<dyn Responder>>,
     subscribers: Vec<Subscriber>,
+    /// Monotonic id handed to each new [`Subscriber`] so its connection thread
+    /// can name it in a [`ControlRequest::Unsubscribe`] on the way out.
+    next_subscriber_id: u64,
     /// The last [`EVENT_BACKLOG_CAP`] broadcast events, oldest first — replayed
     /// to a new subscriber by the connection thread (see
     /// [`crate::control::serve_subscription`]), never by this one.
@@ -681,20 +687,43 @@ impl Core {
     const MAX_MISSES: u32 = 64;
 
     fn load(config_path: &Path, writer_tx: Sender<WriteJob>) -> Self {
+        // `config_error` is copied into `StatusPayload` / `ConfigPayload` and
+        // formatted into `arm` / `config set` refusals — every one of which
+        // crosses the control socket — so store it capped for the wire. The
+        // *full* report always reaches the journal first, uncapped. A
+        // `ValidationReport` is trusted, escape-safe text (only length is a
+        // concern — `cap_report`); a TOML read error echoes a raw source line
+        // from the file and is scrubbed too (`sanitize_report`).
         let (raw, config, config_error) = match config::load(config_path) {
             Ok(raw) => match config::validate(raw.clone()) {
                 Ok(config) => (raw, config, None),
-                Err(report) => (
+                Err(report) => {
+                    tracing::error!(
+                        %report,
+                        "configuration is INVALID — the daemon will run but WILL NOT ARM until it \
+                         is fixed and reloaded (invariant 2)"
+                    );
+                    (
+                        RawConfig::default(),
+                        default_config(),
+                        Some(cap_report(&report.to_string())),
+                    )
+                }
+            },
+            Err(err) => {
+                let full = err.to_string();
+                tracing::error!(
+                    "the configuration file at {} could not be read; the daemon will run but \
+                     WILL NOT ARM (invariant 2):\n{}",
+                    config_path.display(),
+                    sanitize_report(&full)
+                );
+                (
                     RawConfig::default(),
                     default_config(),
-                    Some(report.to_string()),
-                ),
-            },
-            Err(err) => (
-                RawConfig::default(),
-                default_config(),
-                Some(err.to_string()),
-            ),
+                    Some(sanitize_report(&full)),
+                )
+            }
         };
         let responders = build_responders(&config);
         Self {
@@ -706,6 +735,7 @@ impl Core {
             devices: DeviceTracker::default(),
             responders,
             subscribers: Vec::new(),
+            next_subscriber_id: 0,
             event_backlog: VecDeque::with_capacity(EVENT_BACKLOG_CAP),
             // Optimism is not allowed here (invariant 2): the sensor is "not ok"
             // until it has told us its socket opened (`Msg::SensorStarted`).
@@ -1066,6 +1096,13 @@ impl Core {
             );
             return;
         }
+        // Drop any subscriber whose channel is already dead before counting
+        // against the cap. A connection thread sends `Unsubscribe` promptly when
+        // it sees its peer close (within `control::SUBSCRIPTION_POLL`), and
+        // `broadcast` prunes on every event — but a burst of subscribe-and-exit
+        // on a quiet machine can briefly outrun both, and the cap is the only
+        // thing standing between that and an un-disarmable daemon (invariant 5).
+        self.prune_dead_subscribers();
         if self.subscribers.len() >= Self::MAX_SUBSCRIBERS {
             tracing::warn!(
                 limit = Self::MAX_SUBSCRIBERS,
@@ -1081,14 +1118,38 @@ impl Core {
         // ordering matters on a single-threaded core, but it reads as the
         // obviously-correct order: "what happened before you joined".
         let backlog: Vec<StreamEvent> = self.event_backlog.iter().cloned().collect();
+        let id = self.next_subscriber_id;
+        self.next_subscriber_id += 1;
         self.subscribers.push(Subscriber {
+            id,
             tx,
             consecutive_misses: 0,
         });
         let _ = ack.try_send(SubscribeOutcome {
             reply: Reply::Ok,
             backlog,
+            id,
         });
+    }
+
+    /// Drop the subscriber with `id` — its connection thread saw the peer close.
+    fn unsubscribe(&mut self, id: u64) {
+        let before = self.subscribers.len();
+        self.subscribers.retain(|s| s.id != id);
+        if self.subscribers.len() != before {
+            tracing::debug!(id, "event subscriber left");
+        }
+    }
+
+    /// Drop subscribers a prior `broadcast` has already flagged as not reading
+    /// (`consecutive_misses` at the cap). `broadcast` normally removes these
+    /// itself on the *next* event; sweeping here too means a subscribe burst on
+    /// a machine with no events cannot hold their slots against the cap. A
+    /// subscriber whose peer has simply closed is reaped promptly and precisely
+    /// by [`Core::unsubscribe`] instead.
+    fn prune_dead_subscribers(&mut self) {
+        self.subscribers
+            .retain(|s| s.consecutive_misses < Self::MAX_MISSES);
     }
 
     fn status(&self) -> StatusPayload {
@@ -1211,11 +1272,11 @@ impl Core {
             self.armed = false;
             tracing::warn!(peer_uid = peer.uid, peer_pid = peer.pid, "DISARMED");
             self.broadcast(Event::Disarmed);
-            // The destructive opt-in is scoped to a single armed session
-            // (decision recorded in CLAUDE.md, 2026-09-08): a disarm clears the
-            // runtime engage toggle, so re-engaging always means the operator
-            // walks the typed-`DESTROY` fence again. Already cleared on daemon
-            // restart and on a config target change — this adds disarm.
+            // The destructive opt-in is scoped to a single armed session: a
+            // disarm clears the runtime engage toggle, so re-engaging always
+            // means the operator walks the typed-`DESTROY` fence again. Already
+            // cleared on daemon restart and on a config target change — this
+            // adds disarm. (docs/DESIGN-NOTES.md)
             if self.luks_destroy_engaged {
                 self.luks_destroy_engaged = false;
                 tracing::warn!(
@@ -1297,6 +1358,12 @@ impl Core {
                 "config set armed_at_boot"
             }
             ConfigChange::Sensors(names) => {
+                // The sensor supervisor is fixed at startup — it always runs
+                // `UsbNetlinkSensor` — so a live `sensors` change is persisted
+                // but has no runtime effect until a restart (kill-path L5).
+                // `validate` already rejects anything but `["usb"]`, so the only
+                // change that passes is a no-op anyway; `killbillctl` prints the
+                // "restart to apply" note to the operator.
                 raw.detection.sensors = names;
                 "config set sensors"
             }
@@ -1322,6 +1389,18 @@ impl Core {
     /// state, not persisted, so it never goes through `begin_apply`/the
     /// writer thread.
     fn set_luks_destroy_engaged(&mut self, want: bool, peer: PeerCred, reply: SyncSender<Reply>) {
+        // Engaging the runtime opt-in on a destructive action is a
+        // config-mutating-equivalent step: refuse it while the on-disk config is
+        // invalid or a write is in flight, exactly as `whitelist_add` and
+        // `config_set` do. *Dis*engaging is always allowed — it only ever lowers
+        // risk, and an operator must never be blocked from standing a dangerous
+        // toggle back down.
+        if want {
+            if let Some(guard) = self.config_change_refusal("engage LUKS header destruction") {
+                answer(reply, guard);
+                return;
+            }
+        }
         if want && self.config.luks_destroy.is_none() {
             answer(
                 reply,
@@ -1383,7 +1462,10 @@ impl Core {
             Ok(config) => config,
             Err(report) => {
                 tracing::warn!(change = label, %report, "config change REJECTED — file untouched");
-                answer(reply, Reply::Error(format!("{label} rejected:\n{report}")));
+                answer(
+                    reply,
+                    Reply::Error(cap_report(&format!("{label} rejected:\n{report}"))),
+                );
                 return;
             }
         };
@@ -1398,10 +1480,10 @@ impl Core {
                 );
                 answer(
                     reply,
-                    Reply::Error(format!(
+                    Reply::Error(cap_report(&format!(
                         "{label} rejected — while armed, a responder would no longer be able to \
                          act: {detail}"
-                    )),
+                    ))),
                 );
                 return;
             }
@@ -1478,13 +1560,16 @@ impl Core {
             Ok(raw) => raw,
             Err(e) => {
                 self.config_stale = true;
+                // `e` echoes a raw source line on a TOML parse error — sanitize
+                // it before it reaches the journal or a subscriber's terminal.
+                let reason = sanitize_report(&format!(
+                    "reload failed — the config file could not be read: {e}"
+                ));
                 tracing::error!(
-                    error = %e,
                     "reload REJECTED — the config file could not be read; running config and \
-                     armed state kept (invariant 2), on-disk file differs and needs fixing"
+                     armed state kept (invariant 2), on-disk file differs and needs fixing:\n{reason}"
                 );
-                let reason = format!("reload failed — the config file could not be read: {e}");
-                self.broadcast(Event::ReloadFailed(truncate_for_broadcast(&reason)));
+                self.broadcast(Event::ReloadFailed(reason.clone()));
                 answer(reply, Reply::Error(reason));
                 return;
             }
@@ -1498,11 +1583,13 @@ impl Core {
                     "reload REJECTED — the config on disk is invalid; running config and armed \
                      state kept (invariant 2), on-disk file differs and needs fixing"
                 );
-                let reason = format!(
+                // `report` is trusted, escape-safe text (see `cap_report`); the
+                // full copy already went to the journal above via `%report`.
+                let reason = cap_report(&format!(
                     "reload failed — the config on disk is invalid; keeping the running config \
                      and armed state (invariant 2):\n{report}"
-                );
-                self.broadcast(Event::ReloadFailed(truncate_for_broadcast(&reason)));
+                ));
+                self.broadcast(Event::ReloadFailed(reason.clone()));
                 answer(reply, Reply::Error(reason));
                 return;
             }
@@ -1517,11 +1604,11 @@ impl Core {
                     "reload REJECTED while armed — a responder would no longer be able to act; \
                      running config kept, on-disk file differs"
                 );
-                let reason = format!(
+                let reason = cap_report(&format!(
                     "reload rejected — while armed, a responder would no longer be able to act: \
                      {detail}"
-                );
-                self.broadcast(Event::ReloadFailed(truncate_for_broadcast(&reason)));
+                ));
+                self.broadcast(Event::ReloadFailed(reason.clone()));
                 answer(reply, Reply::Error(reason));
                 return;
             }
@@ -1725,6 +1812,7 @@ fn answer_subscribe(ack: SyncSender<SubscribeOutcome>, reply: Reply) {
     let _ = ack.try_send(SubscribeOutcome {
         reply,
         backlog: Vec::new(),
+        id: 0,
     });
 }
 
@@ -1753,49 +1841,6 @@ fn join_failures(failures: &[responder::ResponderNotReady]) -> String {
         .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join("; ")
-}
-
-/// Cap on a `String` this module puts into a broadcast [`Event`] (currently
-/// just `Event::ReloadFailed`'s reason). A [`config::ValidationReport`]
-/// collects *every* problem in the file — unbounded in principle, e.g. a
-/// config with hundreds of malformed whitelist entries — so without this a
-/// single broadcast can exceed `MAX_CONTROL_FRAME` on its own. `encode`
-/// rejects an oversized frame with `ProtocolError::FrameTooLarge`, and unlike
-/// a direct command reply (which `control::serve_connection` already turns
-/// into a small "too large" error) an unsendable *broadcast* event has
-/// nowhere else to go: it would sit in `event_backlog` and break replay for
-/// every subscriber after it, not just this one. So truncate at the source
-/// instead of relying on every write site downstream. The caller who asked
-/// for the reload directly still gets the full, untruncated report in their
-/// own `Reply::Error`; the daemon's log always has the full report too — only
-/// the broadcast copy is capped.
-const MAX_BROADCAST_REASON_LEN: usize = 4096;
-
-fn truncate_for_broadcast(reason: &str) -> String {
-    // Scrub C0/C1 control characters (keeping `\n` and `\t`) before this reaches
-    // every subscriber's terminal. A `ValidationReport` is already escape-safe —
-    // every `ConfigError` field is formatted with `{:?}` — but a TOML parse
-    // error echoes a raw source line, and that is the one broadcast string that
-    // could carry a stray control byte from the root-owned config file.
-    let scrubbed: String = reason
-        .chars()
-        .map(|c| match c {
-            '\n' | '\t' => c,
-            c if c.is_control() => '\u{fffd}',
-            c => c,
-        })
-        .collect();
-    if scrubbed.len() <= MAX_BROADCAST_REASON_LEN {
-        return scrubbed;
-    }
-    let mut cut = MAX_BROADCAST_REASON_LEN;
-    while !scrubbed.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    format!(
-        "{}… (truncated; see the daemon log or run `reload` directly for the full report)",
-        &scrubbed[..cut]
-    )
 }
 
 fn default_config() -> Config {
@@ -2335,9 +2380,9 @@ mod tests {
 
     #[test]
     fn disarm_clears_the_luks_destroy_engage_toggle() {
-        // Decision recorded in CLAUDE.md (2026-09-08): the destructive opt-in is
-        // scoped to one armed session — a disarm clears it, so re-engaging
-        // always walks the typed-`DESTROY` fence again.
+        // The destructive opt-in is scoped to one armed session — a disarm
+        // clears it, so re-engaging always walks the typed-`DESTROY` fence
+        // again (docs/DESIGN-NOTES.md).
         let mut h = Harness::new(
             "[response.luks_destroy]\ni_understand_this_is_irreversible = true\n\
              target_header = \"/dev/nvme0n1p3\"\n",
@@ -2411,6 +2456,61 @@ mod tests {
             erx.try_recv().unwrap().event,
             Event::ReloadFailed(_)
         ));
+    }
+
+    #[test]
+    fn an_oversized_validation_report_is_capped_in_every_wire_path() {
+        // Hundreds of malformed whitelist ids → a ValidationReport far past
+        // MAX_REPORT_LEN. Uncapped it would push Reply::Status / Reply::Config
+        // past MAX_CONTROL_FRAME and leave the operator with no way to see
+        // status precisely when the config is broken (security-auditor L3).
+        let mut body = String::from("[response]\n");
+        for i in 0..800 {
+            body.push_str(&format!("[[whitelist]]\nid = \"bad{i:04}\"\n"));
+        }
+        let h = Harness::new(&body);
+        assert!(h.core.config_error.is_some(), "the config must be rejected");
+
+        let cap = killbill_proto::MAX_REPORT_LEN + 80; // cap + the truncation note
+        let status_err = h.core.status().config_error.unwrap();
+        let config_err = h.core.config_payload().validation_error.unwrap();
+        assert!(status_err.len() <= cap, "status config_error not capped");
+        assert!(
+            config_err.len() <= cap,
+            "config_payload validation_error not capped"
+        );
+        assert!(status_err.contains("truncated"));
+
+        // The whole frames now encode — they would not with the report in full.
+        let status_frame = killbill_proto::encode(&Reply::Status(h.core.status())).unwrap();
+        let config_frame = killbill_proto::encode(&Reply::Config(h.core.config_payload())).unwrap();
+        assert!(status_frame.len() < killbill_proto::MAX_CONTROL_FRAME);
+        assert!(config_frame.len() < killbill_proto::MAX_CONTROL_FRAME);
+    }
+
+    #[test]
+    fn a_reload_failure_reason_reaching_the_wire_is_scrubbed_of_escape_bytes() {
+        let mut h = Harness::new("");
+        let (etx, erx) = sync_channel::<StreamEvent>(4);
+        assert!(matches!(h.subscribe(root(), etx), Reply::Ok));
+
+        // A TOML parse error echoes the offending source line — here with an
+        // embedded ESC and a bidi override.
+        std::fs::write(&h.path, "key = \u{1b}[31m\u{202e}not valid").unwrap();
+        let (tx, rx) = sync_channel::<Reply>(1);
+        h.core.reload(tx);
+        h.pump_writer();
+
+        let Reply::Error(direct) = rx.try_recv().unwrap() else {
+            panic!("expected Reply::Error");
+        };
+        let Event::ReloadFailed(broadcast) = erx.try_recv().unwrap().event else {
+            panic!("expected Event::ReloadFailed");
+        };
+        for s in [&direct, &broadcast] {
+            assert!(!s.contains('\u{1b}'), "escape byte reached the wire");
+            assert!(!s.contains('\u{202e}'), "bidi override reached the wire");
+        }
     }
 
     #[test]
@@ -2596,8 +2696,9 @@ mod tests {
 
     #[test]
     fn an_unauthorized_event_dispatches_only_while_armed() {
-        // power_action = none: the decision fires but attempts_power() is false,
-        // so KILL_IN_FLIGHT is never set and no poweroff syscall is attempted.
+        // power_action = none (and no luks_destroy): the decision fires but
+        // attempts_power_action() is false, so KILL_IN_FLIGHT is never set and
+        // no poweroff syscall is attempted.
         let mut h = Harness::new("[response]\npower_action = \"none\"\n");
         let seen = Arc::new(Mutex::new(Vec::new()));
         h.core.responders = vec![Arc::new(Recorder(Arc::clone(&seen))) as Arc<dyn Responder>];
@@ -2759,6 +2860,41 @@ mod tests {
         h.core
             .on_sensor_event(added(Some(UsbId::new(0x1050, 0x0407))));
         assert!(h.core.subscribers.is_empty(), "dropped subscriber pruned");
+    }
+
+    #[test]
+    fn unsubscribe_frees_the_slot_without_waiting_for_a_broadcast() {
+        // The security-auditor BLOCK: on a quiet armed machine no broadcast
+        // happens, so a departed subscriber's slot must be freed by the
+        // connection thread's explicit `Unsubscribe`, not by the next event.
+        let mut h = Harness::new("");
+        let mut ids = Vec::new();
+        let mut keep_alive = Vec::new(); // hold the receivers so the subscribers stay live
+        for _ in 0..Core::MAX_SUBSCRIBERS {
+            let (tx, rx) = sync_channel::<StreamEvent>(4);
+            keep_alive.push(rx);
+            let (ack, ack_rx) = sync_channel::<SubscribeOutcome>(1);
+            h.core.subscribe(root(), tx, ack);
+            let outcome = ack_rx.try_recv().unwrap();
+            assert!(matches!(outcome.reply, Reply::Ok));
+            ids.push(outcome.id);
+        }
+        // At the cap: the next subscription is refused.
+        let (tx, rx) = sync_channel::<StreamEvent>(4);
+        keep_alive.push(rx);
+        assert!(matches!(h.subscribe(root(), tx), Reply::Error(_)));
+
+        // Every connection thread reports its peer left — no broadcast in between.
+        for id in ids {
+            h.core.unsubscribe(id);
+        }
+        assert!(h.core.subscribers.is_empty());
+
+        // ...and a fresh subscription is accepted again.
+        let (tx, rx) = sync_channel::<StreamEvent>(4);
+        keep_alive.push(rx);
+        assert!(matches!(h.subscribe(root(), tx), Reply::Ok));
+        drop(keep_alive);
     }
 
     #[test]
