@@ -1,0 +1,99 @@
+# shellcheck shell=sh
+# ---------------------------------------------------------------------------
+# killbill-rs maintainer-script contract — CANONICAL COPY.
+#
+# This file is the single source of truth for what happens to /etc/killbill and
+# the killbilld.service unit on install / upgrade / remove / purge, across every
+# packaging path (.deb, .rpm, AUR, install.sh).
+#
+# The .deb and .rpm scriptlets cannot `source` a file from the package payload
+# (it may not exist yet, or may already be gone), so each one inlines the block
+# between the `>>> lib.sh` and `<<< lib.sh` markers below, verbatim.
+# `packaging/scripts/check-sync.sh` (run in CI) fails the build if any copy has
+# drifted from this file.
+#
+# Design rules baked in here:
+#   * A fresh install is ENABLED but never ARMED. `armed_at_boot` defaults to
+#     false in the shipped config and nothing here runs `killbillctl arm`. A
+#     packaging bug must not be able to lock the user out (charter §10).
+#   * The default config is written only if /etc/killbill/config.toml is ABSENT
+#     (idempotent — fixes the original usbkill's broken first-run copy).
+#   * An upgrade never touches the config and never re-enables a unit the admin
+#     disabled.
+#   * Every systemctl call is guarded: in a container / chroot / image build
+#     there is no running systemd and these must be no-ops, not failures.
+# ---------------------------------------------------------------------------
+
+# >>> lib.sh
+kb_config_dir='/etc/killbill'
+kb_config="${kb_config_dir}/config.toml"
+kb_example='/usr/share/killbill-rs/config.example.toml'
+kb_unit='killbilld.service'
+
+# True only when a real systemd is running and reachable.
+kb_have_systemd() {
+	[ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1
+}
+
+# Create /etc/killbill and drop the default config in place if — and only if —
+# there is not already one there.
+kb_install_config() {
+	mkdir -p "$kb_config_dir"
+	chmod 0755 "$kb_config_dir"
+	if [ ! -e "$kb_config" ] && [ -e "$kb_example" ]; then
+		cp "$kb_example" "$kb_config"
+		chmod 0640 "$kb_config"
+		echo "killbill-rs: wrote default config to ${kb_config} (disarmed)"
+	fi
+}
+
+# First-time install: config, then enable + start (safe — disarmed).
+kb_on_install() {
+	kb_install_config
+	kb_have_systemd || return 0
+	systemctl daemon-reload || true
+	systemctl enable "$kb_unit" >/dev/null 2>&1 || true
+	if systemctl start "$kb_unit"; then
+		echo "killbill-rs: killbilld enabled and started, DISARMED. Configure a"
+		echo "            whitelist, then run 'sudo killbillctl arm'."
+	else
+		echo "killbill-rs: WARNING — killbilld was enabled but FAILED TO START;" >&2
+		echo "            the machine is NOT protected. Check:" >&2
+		echo "                systemctl status killbilld" >&2
+	fi
+}
+
+# Upgrade: reload the (possibly changed) unit and restart if it is running.
+# Never re-enable, never touch the config.
+kb_on_upgrade() {
+	kb_have_systemd || return 0
+	systemctl daemon-reload || true
+	# A restart always comes back DISARMED — armed state is deliberately not
+	# persisted. If a running daemon is armed, say so loudly before the restart
+	# drops protection; the operator must re-arm afterwards.
+	if systemctl is-active --quiet "$kb_unit"; then
+		# `timeout` guards against an unresponsive daemon hanging the package
+		# transaction — this runs under dpkg/rpm holding their lock.
+		if command -v killbillctl >/dev/null 2>&1 &&
+			timeout 5 killbillctl status 2>/dev/null | grep -qi '^armed: *yes'; then
+			echo "killbill-rs: WARNING — killbilld is ARMED; the upgrade restart will leave it" >&2
+			echo "            DISARMED. Run 'sudo killbillctl arm' again once the upgrade finishes." >&2
+		fi
+		systemctl try-restart "$kb_unit" || true
+	fi
+}
+
+# Removal (not purge): stop and disable. Leave /etc/killbill in place.
+kb_on_remove() {
+	kb_have_systemd || return 0
+	systemctl disable --now "$kb_unit" >/dev/null 2>&1 || true
+	systemctl daemon-reload || true
+}
+
+# Purge (.deb only): drop the config tree too. `${var:?}` aborts rather than
+# `rm -rf` a bare "/" if the variable is ever somehow empty (charter §12 — the
+# original usbkill's `dirname` bug).
+kb_on_purge() {
+	rm -rf "${kb_config_dir:?}"
+}
+# <<< lib.sh

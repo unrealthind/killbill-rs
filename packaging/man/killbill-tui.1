@@ -1,0 +1,126 @@
+.TH KILLBILL-TUI 1 "2026-09-09" "killbill-rs 0.1.0" "User Commands"
+.SH NAME
+killbill-tui \- terminal UI for the killbill-rs daemon
+.SH SYNOPSIS
+.B killbill-tui
+.RB [ \-\-socket
+.IR PATH ]
+.SH DESCRIPTION
+.B killbill-tui
+is a full-screen
+.BR ratatui (7)-style
+client for
+.BR killbilld (8).
+It shows the live device list, armed state, whitelist, settings, dry-run
+results, an event log, a read-only config inspector, and the fenced LUKS-destroy
+screen.
+.PP
+It holds
+.B no authority.
+The daemon owns the config and the armed state; the TUI only sends the same
+control-protocol commands
+.BR killbillctl (1)
+does. Quitting the TUI, or killing it with
+.BR SIGKILL ,
+.B never
+changes whether the daemon is armed.
+.PP
+State-changing actions require the process to run as
+.B uid 0
+(the control socket is mode
+.B 0660
+owned
+.BR root:root ).
+.SH OPTIONS
+.TP
+.BR \-s ", " \-\-socket " " \fIPATH\fR
+Path to the daemon's control socket. Default:
+.IR /run/killbilld.sock .
+.TP
+.BR \-h ", " \-\-help
+Print help.
+.TP
+.BR \-V ", " \-\-version
+Print version.
+.SH KEYS
+Navigation is menu-driven: arrows and
+.B Enter
+do everything, letters are accelerators.
+.SS Everywhere
+.TP
+.BR \[u2191] " / " \[u2193] " (" k " / " j )
+Move the selection, or scroll.
+.TP
+.B Enter
+Activate the selected item, or confirm a modal.
+.TP
+.B Esc
+Close a modal, otherwise return to the Devices screen.
+.TP
+.B m
+Open the main menu (also closes any other modal).
+.TP
+.B ?
+Help screen.
+.TP
+.B r
+Refresh the current screen \(en or retry the connection while the daemon is
+down.
+.TP
+.B q
+Quit immediately. Never disarms the daemon.
+.TP
+.B Ctrl-C
+Quit, from anywhere, including inside a text field.
+.SS Devices (home)
+.TP
+.B Enter
+Act on the selected device: add it to, or remove it from, the whitelist.
+.SS Whitelist
+.TP
+.B "Enter (top row)"
+Add an entry by typing a
+.I vendor:product
+id.
+.TP
+.B "Enter (an entry)"
+Edit its max count, or remove it.
+.SS Settings
+.TP
+.B Enter
+Toggle or cycle the selected field, applied via the daemon.
+.SS Dry-run
+.TP
+.B r
+Run the policy engine again over the current devices.
+.SS Event log
+.TP
+.BR \[u2191] " / " \[u2193]
+Scroll back through the stream (pauses following).
+.TP
+.B p
+Freeze or resume following the newest line.
+.SS LUKS destroy
+.TP
+.B Enter
+Start the typed-\fBDESTROY\fR fence to engage or disengage. Then type
+.B DESTROY
+exactly, then
+.BR y .
+Any other key at either step cancels and sends nothing. The wipe is a stub in
+v1.
+.SH MAIN MENU
+Devices, Whitelist, Dry-run, Settings, Event log, Config, LUKS destroy (greyed
+until configured), Arm (greyed while the config is invalid), Disarm, Reload,
+Help, Quit. Arm, Disarm and Reload each ask for confirmation first.
+.SH ENVIRONMENT
+.TP
+.B NO_COLOR
+If set, the interface is rendered without colour; armed/disarmed and hazard
+states are always distinguished by glyph and word as well as colour.
+.SH SEE ALSO
+.BR killbilld (8),
+.BR killbillctl (1),
+.BR killbill.conf (5)
+.SH BUGS
+.I https://github.com/unrealthind/killbill-rs/issues

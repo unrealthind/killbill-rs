@@ -1,0 +1,21 @@
+#!/bin/sh
+# killbill-rs .deb prerm. See packaging/scripts/lib.sh for the contract.
+# Stopping on remove only; an upgrade leaves the running daemon alone (postinst
+# does a try-restart against the new unit). Disable + daemon-reload happen in
+# postrm.
+set -e
+
+case "$1" in
+	remove | deconfigure)
+		if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+			systemctl stop killbilld.service || true
+		fi
+		;;
+	upgrade | failed-upgrade) ;;
+	*)
+		echo "prerm: unrecognized argument '$1'" >&2
+		exit 1
+		;;
+esac
+
+exit 0

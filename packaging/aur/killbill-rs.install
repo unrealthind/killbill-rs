@@ -1,0 +1,54 @@
+# killbill-rs pacman hooks. Mirrors the contract in packaging/scripts/lib.sh
+# (which .deb/.rpm inline verbatim; pacman needs its own function names, so this
+# file is kept in step by hand — packaging/scripts/check-sync.sh asserts the
+# armed-upgrade warning below is present):
+# enabled-but-never-armed on install; config written only if absent; a fresh
+# install can never lock the user out; an upgrade that disarms a running armed
+# daemon says so loudly.
+
+_kb_config_dir='/etc/killbill'
+_kb_config="${_kb_config_dir}/config.toml"
+_kb_example='/usr/share/killbill-rs/config.example.toml'
+_kb_unit='killbilld.service'
+
+post_install() {
+	install -d -m 0755 "$_kb_config_dir"
+	if [ ! -e "$_kb_config" ] && [ -e "$_kb_example" ]; then
+		install -m 0640 "$_kb_example" "$_kb_config"
+		echo ">>> killbill-rs: wrote default config to ${_kb_config} (disarmed)"
+	fi
+	systemctl daemon-reload || true
+	systemctl enable "$_kb_unit" >/dev/null 2>&1 || true
+	if systemctl start "$_kb_unit"; then
+		cat <<'EOF'
+>>> killbilld is enabled and running, DISARMED.
+>>> Configure a whitelist in /etc/killbill/config.toml, then:
+>>>   sudo killbillctl arm
+EOF
+	else
+		echo ">>> killbill-rs: WARNING — killbilld failed to start; the machine is NOT" >&2
+		echo ">>>              protected. Check: systemctl status killbilld" >&2
+	fi
+}
+
+post_upgrade() {
+	systemctl daemon-reload || true
+	if systemctl is-active --quiet "$_kb_unit"; then
+		# A restart always comes back DISARMED (armed state is not persisted).
+		if command -v killbillctl >/dev/null 2>&1 &&
+			timeout 5 killbillctl status 2>/dev/null | grep -qi '^armed: *yes'; then
+			echo ">>> killbill-rs: WARNING — killbilld is ARMED; this upgrade restart leaves it" >&2
+			echo ">>>              DISARMED. Run 'sudo killbillctl arm' again afterwards." >&2
+		fi
+		systemctl try-restart "$_kb_unit" || true
+	fi
+}
+
+pre_remove() {
+	systemctl disable --now killbilld.service || true
+}
+
+post_remove() {
+	systemctl daemon-reload || true
+	echo ">>> killbill-rs: /etc/killbill left in place. Remove it by hand if you are done."
+}

@@ -1,0 +1,90 @@
+# killbilld.service — the killbill-rs daemon under systemd.
+#
+# The daemon binds its control socket at the compiled-in default
+# /run/killbilld.sock (charter §8; mode 0660, root:root, set after bind).
+# ProtectSystem=full — not =strict — because =strict would mount /run read-only
+# and the bind would fail; =full still makes /usr, /boot, /efi and /etc
+# read-only, and ReadWritePaths below re-opens the one path the daemon writes.
+
+[Unit]
+Description=killbill-rs USB-kill daemon
+Documentation=man:killbilld(8) man:killbill.conf(5) https://github.com/unrealthind/killbill-rs
+# Ordered after local filesystems only (config lives on /etc): protection should
+# come up as early in boot as possible, not wait on the rest of multi-user.
+After=local-fs.target
+
+[Service]
+Type=exec
+ExecStart=/usr/bin/killbilld
+
+# --- restart / stop semantics -------------------------------------------------
+# A real power action parks the process on purpose, forever — the machine is
+# powering off. systemd must NOT escalate to SIGKILL or it decapitates an
+# in-progress poweroff (charter §10, kill-path finding L7). This is safe only
+# because KILL_IN_FLIGHT latches strictly on a power action (not on an engaged
+# luks_destroy, which returns) — see killbilld/src/responder/mod.rs.
+Restart=on-failure
+RestartSec=2
+KillSignal=SIGTERM
+SendSIGKILL=no
+TimeoutStopSec=infinity
+# Start-rate limit left at the systemd default (5 starts / 10 s → `failed`): a
+# persistently-failing sensor should land in a visible `failed` state a monitor
+# can see, not loop forever. A dead sensor means no protection either way.
+
+# --- privilege ---------------------------------------------------------------
+# Runs as root with exactly one capability: CAP_SYS_BOOT for reboot(2). The
+# arm-time preflight refuses to arm without it. Do NOT add CAP_NET_ADMIN:
+# receiving kernel uevents needs no capability, and holding it would let the
+# daemon (or anything sharing its user) forge uevents.
+User=root
+CapabilityBoundingSet=CAP_SYS_BOOT
+AmbientCapabilities=
+NoNewPrivileges=yes
+# The poweroff preflight reads /proc/self/status (CapEff:); keep it visible.
+ProtectProc=invisible
+# NOT ProcSubset=pid: it would hide /proc/sysrq-trigger, which the poweroff
+# responder writes as its last-resort fallback when reboot(2) fails
+# (kill-path guarantee — see ProtectKernelTunables below).
+
+# --- filesystem -------------------------------------------------------------
+ProtectSystem=full
+ReadWritePaths=/etc/killbill
+ProtectHome=yes
+PrivateTmp=yes
+# Fine for the shipped config (no [response.luks_destroy] target). Operators who
+# configure luks_destroy must drop in PrivateDevices=no — its arm-time preflight
+# stat()s the /dev target. See killbilld.service.d/luks-destroy.conf.example.
+PrivateDevices=yes
+
+# --- kernel / namespace hardening -----------------------------------------
+# ProtectKernelTunables stays OFF: the poweroff responder's last-resort
+# fallback writes /proc/sysrq-trigger if reboot(2) fails. That is a kill-path
+# guarantee; the primary reboot(2) path does not depend on it either way.
+ProtectKernelTunables=no
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+UMask=0077
+
+# --- network / syscalls ---------------------------------------------------
+# Only AF_UNIX (control socket) and AF_NETLINK (uevent sensor).
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+IPAddressDeny=any
+SystemCallArchitectures=native
+# @system-service covers socket/bind/connect/recvfrom/set-getsockopt. It does
+# NOT include reboot(2) — add @reboot. Do NOT append ~@privileged: it strips
+# reboot back out and the daemon would fail to power the machine off.
+SystemCallFilter=@system-service @reboot
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

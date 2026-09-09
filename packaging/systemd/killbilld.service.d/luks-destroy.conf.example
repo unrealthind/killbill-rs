@@ -1,0 +1,12 @@
+# Drop-in for operators who have configured [response.luks_destroy].
+#
+# Install as /etc/systemd/system/killbilld.service.d/luks-destroy.conf, then
+# `systemctl daemon-reload`. The LUKS-destroy responder's arm-time preflight
+# stat()s the target block device under /dev, which PrivateDevices=yes hides —
+# so the daemon would refuse to arm. This re-exposes /dev.
+#
+# The wipe itself is still a stub in v1. This only lets the daemon arm with a
+# luks_destroy target configured.
+
+[Service]
+PrivateDevices=no
