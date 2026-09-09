@@ -38,8 +38,10 @@
 //!   while it is set: a `SIGTERM` in the same millisecond as a real kill must
 //!   not be able to tear down the poweroff thread (invariant 5 — a signal must
 //!   never skip a pending kill). The latch is only set for an action that
-//!   actually attempts a power action, so a healthy daemon after a dry run
-//!   shuts down normally.
+//!   actually attempts a power action — `reboot(2)` is expected not to return,
+//!   so "park forever" means "the machine is going down". A dry run, and an
+//!   engaged `luks_destroy` with `power_action = "none"`, both leave it clear,
+//!   so a healthy daemon still shuts down normally.
 //! * Arming must call [`preflight`] and refuse to arm (loudly) if it reports
 //!   any responder cannot act — e.g. no `CAP_SYS_BOOT`, or a non-Linux host
 //!   (invariant 2).
@@ -62,20 +64,28 @@ pub(crate) use logger::LoggerResponder;
 pub(crate) use luks_destroy::LuksDestroyResponder;
 pub(crate) use poweroff::PoweroffResponder;
 
-/// Set by [`dispatch`] when it fans out an action that will actually attempt a
-/// power action (not a dry run, not `power_action = "none"`), and never cleared.
+/// Set by [`dispatch`] when it fans out an action that attempts a real power
+/// action, and never cleared. A dry run does not set it, and neither does an
+/// engaged `luks_destroy` on its own: this latch means "the process must park
+/// forever because `reboot(2)` is not expected to return", which is only true
+/// for a power action. A responder that is irreversible but *returns* (the LUKS
+/// header wipe, once it is real — invariant 3) must not use this latch; it needs
+/// its own bounded in-flight guard so a stuck responder cannot make the daemon
+/// permanently unstoppable and the host un-shutdownable.
 static KILL_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 
 /// Set by the poweroff responder when `reboot(2)` **and** every last-resort
 /// fallback have failed and the machine is still up. See [`kill_failed`].
 static KILL_FAILED: AtomicBool = AtomicBool::new(false);
 
-/// `true` once a real kill has been dispatched. The signal-driven shutdown path
-/// must not let the process exit while this holds — doing so would destroy the
-/// detached poweroff thread before it reaches `reboot(2)` (invariant 5). Since
-/// `reboot(2)` does not return, "block forever" is the correct behaviour there:
-/// the machine dies, not the daemon. A dry run or `power_action = "none"` never
-/// sets it, so an ordinary shutdown after those is unaffected.
+/// `true` once a real power action has been dispatched. The signal-driven
+/// shutdown path must not let the process exit while this holds — doing so would
+/// destroy a detached poweroff thread before it finishes (invariant 5: a signal
+/// must never skip a pending kill). `reboot(2)` does not return on success, so
+/// "block forever" is correct here: the machine dies, not the daemon. A dry run
+/// never sets it, and an engaged `luks_destroy` with `power_action = "none"`
+/// does not either — that responder returns, and parking forever on a response
+/// that returns would leave the daemon unstoppable (see [`KILL_IN_FLIGHT`]).
 #[must_use]
 pub fn kill_in_flight() -> bool {
     KILL_IN_FLIGHT.load(Ordering::SeqCst)
@@ -146,7 +156,7 @@ pub struct ResponderNotReady {
 /// that is not already wedged is not a real risk, and the inline fallback
 /// covers the case where the thread cannot be created at all.
 pub fn dispatch(action: &Action, responders: &[Arc<dyn Responder>]) {
-    if attempts_power(action) {
+    if attempts_power_action(action) {
         KILL_IN_FLIGHT.store(true, Ordering::SeqCst);
     }
 
@@ -181,8 +191,15 @@ pub fn dispatch(action: &Action, responders: &[Arc<dyn Responder>]) {
     );
 }
 
-/// Whether `action` will actually try to power the machine down.
-fn attempts_power(action: &Action) -> bool {
+/// Whether `action` attempts a real power action, and so must latch
+/// [`KILL_IN_FLIGHT`] — the "park forever, `reboot(2)` will not return" flag. A
+/// dry run does not; `power_action = "none"` does not, even with `luks_destroy`
+/// engaged. `luks_destroy` is a logging stub in v1 (invariant 3), and when the
+/// wipe becomes real it will still *return* — so it must get its own bounded
+/// guard, not this latch (see [`KILL_IN_FLIGHT`]). Latching here on a response
+/// that returns is what makes the daemon unstoppable and the host
+/// un-shutdownable.
+fn attempts_power_action(action: &Action) -> bool {
     !action.dry_run && action.power != PowerAction::None
 }
 
@@ -270,7 +287,7 @@ mod tests {
     }
 
     #[test]
-    fn attempts_power_only_for_a_real_power_action() {
+    fn only_a_real_power_action_latches_the_park_forever_flag() {
         let real = Action {
             power: PowerAction::PowerOff,
             dry_run: false,
@@ -284,9 +301,22 @@ mod tests {
             power: PowerAction::None,
             ..real.clone()
         };
-        assert!(attempts_power(&real));
-        assert!(!attempts_power(&dry));
-        assert!(!attempts_power(&none));
+        // `power_action = "none"` with LUKS header destruction engaged: the LUKS
+        // responder is irreversible in intent but it *returns* (a stub today,
+        // invariant 3; a bounded operation when the wipe is real). Latching
+        // `KILL_IN_FLIGHT` here would park the process forever on a response
+        // that finishes in microseconds — making the daemon unstoppable and the
+        // host un-shutdownable. It must stay clear.
+        let luks_only = Action {
+            power: PowerAction::None,
+            luks_destroy: true,
+            dry_run: false,
+            ..act()
+        };
+        assert!(attempts_power_action(&real));
+        assert!(!attempts_power_action(&dry));
+        assert!(!attempts_power_action(&none));
+        assert!(!attempts_power_action(&luks_only));
     }
 
     #[test]

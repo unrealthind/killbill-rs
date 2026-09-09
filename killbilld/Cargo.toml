@@ -3,7 +3,13 @@ name = "killbilld"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 description = "The killbill-rs daemon: watches USB events and powers off on an unauthorized change while armed."
+publish = false
 
 [lib]
 name = "killbilld"
@@ -34,3 +40,132 @@ signal-hook = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
+
+# ---------------------------------------------------------------------------
+# Packaging (Phase 3). Both backends are driven from this crate and bundle all
+# three binaries. Static musl builds → no shared-library dependencies.
+#
+#   cargo build --release --target x86_64-unknown-linux-musl --workspace
+#   cargo deb          -p killbilld --target x86_64-unknown-linux-musl --no-build
+#   cargo generate-rpm -p killbilld --target x86_64-unknown-linux-musl
+#
+# Asset source paths under `target/release/` are auto-remapped to the
+# `--target` directory by cargo-deb; cargo-generate-rpm needs the explicit
+# path, so its assets name the musl triple directly.
+# ---------------------------------------------------------------------------
+
+[package.metadata.deb]
+name = "killbill-rs"
+maintainer = "unrealthind <unrealthind@users.noreply.github.com>"
+copyright = "2026 unrealthind. Licensed GPL-3.0-or-later."
+license-file = ["../LICENSE", "0"]
+section = "admin"
+priority = "optional"
+# Static musl binary: no shared-library dependencies. systemd is required for
+# the daemon to be useful (no other init is supported — charter §11).
+depends = "systemd"
+extended-description = """
+Event-driven successor to the Python usbkill. A root daemon watches USB
+add/remove events on the kernel netlink uevent socket and, when armed and an
+unauthorized change occurs, powers the machine off so the LUKS disk re-locks.
+
+Ships killbilld (the daemon), killbillctl (CLI) and killbill-tui (terminal UI).
+Installed disarmed; arm it only after configuring a whitelist."""
+assets = [
+    ["target/release/killbilld", "usr/bin/", "755"],
+    ["target/release/killbillctl", "usr/bin/", "755"],
+    ["target/release/killbill-tui", "usr/bin/", "755"],
+    ["config.example.toml", "usr/share/killbill-rs/config.example.toml", "644"],
+    ["packaging/systemd/killbilld.service", "usr/lib/systemd/system/killbilld.service", "644"],
+    ["packaging/systemd/killbilld.service.d/luks-destroy.conf.example", "usr/share/killbill-rs/killbilld.service.d/luks-destroy.conf.example", "644"],
+    ["packaging/man/killbilld.8", "usr/share/man/man8/", "644"],
+    ["packaging/man/killbillctl.1", "usr/share/man/man1/", "644"],
+    ["packaging/man/killbill-tui.1", "usr/share/man/man1/", "644"],
+    ["packaging/man/killbill.conf.5", "usr/share/man/man5/", "644"],
+    ["README.md", "usr/share/doc/killbill-rs/README.md", "644"],
+    ["CHANGELOG.md", "usr/share/doc/killbill-rs/CHANGELOG.md", "644"],
+]
+maintainer-scripts = "packaging/deb/"
+
+[package.metadata.generate-rpm]
+name = "killbill-rs"
+summary = "Event-driven USB-kill daemon (poweroff so a LUKS disk re-locks)"
+license = "GPL-3.0-or-later"
+# Static musl binary: skip the automatic ELF dependency scan.
+auto-req = "no"
+requires = { systemd = "*" }
+post_install_script = { path = "packaging/rpm/post.sh", interpreter = "/bin/sh" }
+pre_uninstall_script = { path = "packaging/rpm/preun.sh", interpreter = "/bin/sh" }
+post_uninstall_script = { path = "packaging/rpm/postun.sh", interpreter = "/bin/sh" }
+
+[[package.metadata.generate-rpm.assets]]
+source = "target/x86_64-unknown-linux-musl/release/killbilld"
+dest = "/usr/bin/killbilld"
+mode = "755"
+
+[[package.metadata.generate-rpm.assets]]
+source = "target/x86_64-unknown-linux-musl/release/killbillctl"
+dest = "/usr/bin/killbillctl"
+mode = "755"
+
+[[package.metadata.generate-rpm.assets]]
+source = "target/x86_64-unknown-linux-musl/release/killbill-tui"
+dest = "/usr/bin/killbill-tui"
+mode = "755"
+
+[[package.metadata.generate-rpm.assets]]
+source = "packaging/systemd/killbilld.service"
+dest = "/usr/lib/systemd/system/killbilld.service"
+mode = "644"
+
+[[package.metadata.generate-rpm.assets]]
+source = "config.example.toml"
+dest = "/usr/share/killbill-rs/config.example.toml"
+mode = "644"
+
+[[package.metadata.generate-rpm.assets]]
+source = "packaging/systemd/killbilld.service.d/luks-destroy.conf.example"
+dest = "/usr/share/killbill-rs/killbilld.service.d/luks-destroy.conf.example"
+mode = "644"
+
+[[package.metadata.generate-rpm.assets]]
+source = "packaging/man/killbilld.8"
+dest = "/usr/share/man/man8/killbilld.8"
+mode = "644"
+doc = true
+
+[[package.metadata.generate-rpm.assets]]
+source = "packaging/man/killbillctl.1"
+dest = "/usr/share/man/man1/killbillctl.1"
+mode = "644"
+doc = true
+
+[[package.metadata.generate-rpm.assets]]
+source = "packaging/man/killbill-tui.1"
+dest = "/usr/share/man/man1/killbill-tui.1"
+mode = "644"
+doc = true
+
+[[package.metadata.generate-rpm.assets]]
+source = "packaging/man/killbill.conf.5"
+dest = "/usr/share/man/man5/killbill.conf.5"
+mode = "644"
+doc = true
+
+[[package.metadata.generate-rpm.assets]]
+source = "README.md"
+dest = "/usr/share/doc/killbill-rs/README.md"
+mode = "644"
+doc = true
+
+[[package.metadata.generate-rpm.assets]]
+source = "CHANGELOG.md"
+dest = "/usr/share/doc/killbill-rs/CHANGELOG.md"
+mode = "644"
+doc = true
+
+[[package.metadata.generate-rpm.assets]]
+source = "LICENSE"
+dest = "/usr/share/licenses/killbill-rs/LICENSE"
+mode = "644"
+doc = true

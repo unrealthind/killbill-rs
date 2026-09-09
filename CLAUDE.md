@@ -120,11 +120,13 @@ Findings deliberately **deferred** — do not re-raise these as new, and do not
   and every live push, so this will fail to decode against a real daemon until
   step 4 fixes it — decode `StreamEvent` and read `.event`, same as
   `killbillctl`'s `stream_events` now does.
-- *Phase 3.* `killbilld.service` needs `SendSIGKILL=no` (or a long
-  `TimeoutStopSec`) or systemd will kill a daemon deliberately parked on
-  `kill_in_flight`. And `bind_listener` should refuse to start when the socket's
-  parent directory is group- or other-writable: mode and ownership are set by
-  path, not fd, so a non-`/run` `--socket` there is a symlink-swap window.
+- *Phase 3 — both now DONE (2026-09-09 review gate).* `killbilld.service`
+  carries `KillSignal=SIGTERM` + `SendSIGKILL=no` + `TimeoutStopSec=infinity`
+  (safe only because `KILL_IN_FLIGHT` latches strictly on a power action, not on
+  an engaged `luks_destroy` — the widened predicate was reverted, see below).
+  `control::bind_listener` refuses to start when the socket's parent directory
+  is group/other-writable without the sticky bit (`ensure_parent_dir_is_safe`,
+  3 tests).
 - *Noted, not fixed.* An allowed device event while armed logs at `debug!`,
   below the default journal level. Device-string truncation at
   `MAX_DEVICE_STRING` is identity-lossy — acceptable because `usb_id`, not the
@@ -557,9 +559,81 @@ through `open_destroy_fence` so it exercises the new target-capture.
   (`m`/`?`), so the fence's captured target can't outlive its modal; the
   disarm test asserts the `ConfigChanged` broadcast reaches a subscriber.
 
-**Still owed at step 13:** a full-tree `code-quality` + `tui-ux` +
-`security-auditor` + `kill-path-reliability` sign-off (the scoped passes
-above cover only the fix batch, not steps 4–12 as a whole).
+**Full-tree review gate RUN 2026-09-09** (Phase 2 committed `f3c6d88` + the
+Phase 3 sub-phase 3.5 daemon+TUI batch + the packaging tree, all four agents,
+read-only). This clears both the deferred steps 1–3 confirmation and the
+steps 4–12 gate.
+
+- `code-quality` — **PASS**. Two must-fix-before-tag, both fixed:
+  `sanitize_report` (an ASCII allowlist) was being applied to the daemon's own
+  trusted, escape-safe validation prose, turning legitimate `—`/`§` into
+  U+FFFD, and `Core::load` logged the *capped* report so a >4 KiB report
+  reached no sink in full. Split into `cap_report` (length-only, for trusted
+  reports — non-ASCII survives) and `sanitize_report` (scrub + cap, for the
+  one untrusted string, a raw TOML parse echo); `Core::load` now logs
+  `%report` uncapped; `begin_apply` replies capped too. New proto tests.
+- `tui-ux` — **PASS**. Four should-fix, all fixed: status band now emits
+  `SENSOR STOPPED`/`EVENTS LOST` *before* the `DRY-RUN`/`POWER` belts (an
+  unchosen failure must not be the span that clips); `help::line_count` was
+  undercounting because `render` wrapped — `Wrap` dropped, count now exact;
+  the DESTROY "wipe is a v1 stub" line moved above the 18-row fold; Ctrl-C
+  documented in Help. Handed over a 10-item manual-test checklist (NO_COLOR,
+  resize, `kill -9`, fence rigor) for the operator.
+- `security-auditor` — **BLOCK → cleared**, entirely in packaging (zero
+  invariant violations; the daemon batch itself clean). `ProtectSystem=strict`
+  made `/run` read-only so the daemon could never bind its socket → `full`.
+  `ProcSubset=pid` hid `/proc/sysrq-trigger`, killing the poweroff last-resort
+  fallback → removed. `killbilld.8` documented a socket parent-dir guard that
+  did not exist → implemented (`ensure_parent_dir_is_safe`). `install.sh
+  --prefix` was unvalidated (root unit `ExecStart` → user-writable binary) →
+  now refuses a non-root-owned / world-writable / `/home|/tmp` prefix. Socket
+  path reconciled to `/run/killbilld.sock` across the man pages.
+  `PKGBUILD sha256sums=('SKIP')` → `packaging/scripts/check-release.sh` fails
+  the release while it stands. `begin_apply` reply cap (L1), installer
+  start-then-verify (M5), `rm -rf "${dir:?}"` (N2) also done.
+- `kill-path-reliability` — **BLOCK → cleared**. One real code bug: the 3.5
+  batch had widened `KILL_IN_FLIGHT` to latch on `power = none && luks_destroy`
+  — but that path never calls `reboot(2)` and never sets `KILL_FAILED`, so the
+  latch never cleared → daemon unstoppable, `systemctl stop`/system-shutdown
+  hang forever under `SendSIGKILL=no`, panic guard parks forever → a path to an
+  un-disarmable daemon (invariant 5). Reverted: `KILL_IN_FLIGHT` latches
+  strictly on a real power action (`attempts_power_action`); an irreversible
+  *responder that returns* (the LUKS wipe, once real) will need its own
+  *bounded* guard, documented in `responder/mod.rs`. Also: package upgrade now
+  warns loudly before a restart disarms a running armed daemon (M1);
+  `peer_has_closed` treats `EINTR` as "still here" (L2); `After=local-fs.target`
+  not `multi-user.target` so protection comes up earlier in boot (M3).
+- *Deferred, recorded, NOT fixed for v0.1.0:* the two agents gave **opposed**
+  recommendations on the systemd start-rate limit (`security` wants
+  `StartLimitIntervalSec=0` / infinite restart; `kill-path` wants it to land
+  deterministically in `failed`). Left at the systemd default (→ `failed`),
+  which is `kill-path`'s side — a dead sensor means no protection either way and
+  `failed` is the monitorable state. Revisit if an operator asks.
+  `sec` L3 (AUR `.install` re-implements the maintainer contract instead of
+  inlining `lib.sh`), L5 (`install.sh` manifest ignores `--prefix`), L7 (the
+  LUKS drop-in re-exposes all of `/dev`) also deferred.
+**Scoped re-review 2026-09-09** — `security-auditor` + `kill-path-reliability`
+on the `KILL_IN_FLIGHT` revert + the packaging tree: **both PASS, the BLOCK
+clears.** `kill-path` confirmed "the latch predicate now matches the syscall
+predicate exactly" and no invariant regression. `security` re-traced every
+`cap_report` call site and confirmed no untrusted string reaches it, and that
+`deny.toml` now enforces the no-network rule at the dependency level. Follow-ups
+applied in the same pass: the AUR `post_upgrade` armed-warning + `timeout 5` on
+the `killbillctl status` probe everywhere (it runs under the dpkg/rpm lock);
+`ensure_parent_dir_is_safe` now requires every ancestor to be **root-owned** and
+not group/other-writable (matching `install.sh`'s definition), canonicalizes
+first, and the sticky-bit carve-out is gone; `install.sh --prefix` perm check is
+`stat`-based (one tool, fails closed); `check-release.sh` fails closed on an
+unreadable version and its `SKIP` grep is widened; `CONTRIBUTING.md` gained a
+"Cutting a release" gate list. No must-fix code items remain.
+
+**Owed to Phase 3 — all DONE.** Sub-phase 9 (`.github/workflows/{ci,release}.yml`),
+sub-phase 10 (README rewrite, `.gitignore` reword, source comments repointed off
+`CLAUDE.md` — `git grep -i claude` on tracked files is clean bar the necessary
+`.gitignore` patterns), sub-phase 11 (charter §10 rewritten, §13 decisions 5–7
+added). Remaining for the tag: the full-tree 4-agent sign-off, the manual TUI
+checks (`NO_COLOR` / resize / `kill -9`), a clean-VM package install, `minisign
+-G`, then commit + tag.
 
 After the `Conn::Down` fix + `cargo fmt --all`: `cargo fmt --all --check`,
 `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test
@@ -763,14 +837,10 @@ since the daemon started. Config comments are lost on daemon-side writes.
 post-event) is still undecided — it did not block steps 5–7 and does not block
 the hardware run.
 
-**Owed to Phase 3 (from the sign-off gate, not yet done):** `killbilld.service`
-needs `SendSIGKILL=no` or a long `TimeoutStopSec`, or systemd will `SIGKILL` a
-daemon deliberately parked on `kill_in_flight` (validated as necessary via a
-local test unit in the step 0.5 hardware-gate run — carry `KillSignal=SIGTERM`
-+ `SendSIGKILL=no` into the packaged unit); and `bind_listener` should refuse
-to start if the socket's parent directory is group- or other-writable (socket
-mode/ownership are set by path, not fd, so a non-`/run` `--socket` in a writable
-directory is a symlink-swap window).
+**Owed to Phase 3 — DONE (2026-09-09).** `packaging/systemd/killbilld.service`
+carries `KillSignal=SIGTERM` + `SendSIGKILL=no` + `TimeoutStopSec=infinity`;
+`control::bind_listener` refuses a group/other-writable (non-sticky) socket
+parent directory. Both landed in the Phase 3 review gate below.
 
 **Platform note:** development is now on Fedora Linux (the earlier macOS note is
 retired). Still write platform-neutral code — types, config, policy, protocol,

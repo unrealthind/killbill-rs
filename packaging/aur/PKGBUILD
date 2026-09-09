@@ -1,0 +1,61 @@
+# Maintainer: unrealthind <unrealthind@users.noreply.github.com>
+pkgname=killbill-rs
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Event-driven USB-kill daemon: powers the machine off on an unauthorized USB change so a LUKS disk re-locks"
+arch=('x86_64')
+url="https://github.com/unrealthind/killbill-rs"
+license=('GPL-3.0-or-later')
+depends=('systemd')
+makedepends=('cargo')
+backup=('etc/killbill/config.toml')
+install="${pkgname}.install"
+source=("${pkgname}-${pkgver}.tar.gz::${url}/archive/refs/tags/v${pkgver}.tar.gz")
+# RELEASE GATE: 'SKIP' means no integrity check on the source of a root daemon.
+# Before tagging, run `updpkgsums` (pacman-contrib) against the release tarball
+# and commit the real digest. packaging/scripts/check-release.sh fails while
+# this still says 'SKIP'.
+sha256sums=('SKIP')
+
+prepare() {
+	cd "${pkgname}-${pkgver}"
+	export RUSTUP_TOOLCHAIN=stable
+	cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+	cd "${pkgname}-${pkgver}"
+	export RUSTUP_TOOLCHAIN=stable
+	export CARGO_TARGET_DIR=target
+	cargo build --frozen --release --workspace
+}
+
+check() {
+	cd "${pkgname}-${pkgver}"
+	export RUSTUP_TOOLCHAIN=stable
+	cargo test --frozen --release --workspace
+}
+
+package() {
+	cd "${pkgname}-${pkgver}"
+
+	install -Dm755 target/release/killbilld    "${pkgdir}/usr/bin/killbilld"
+	install -Dm755 target/release/killbillctl  "${pkgdir}/usr/bin/killbillctl"
+	install -Dm755 target/release/killbill-tui "${pkgdir}/usr/bin/killbill-tui"
+
+	install -Dm644 packaging/systemd/killbilld.service \
+		"${pkgdir}/usr/lib/systemd/system/killbilld.service"
+	install -Dm644 packaging/systemd/killbilld.service.d/luks-destroy.conf.example \
+		"${pkgdir}/usr/share/killbill-rs/killbilld.service.d/luks-destroy.conf.example"
+	install -Dm644 config.example.toml \
+		"${pkgdir}/usr/share/killbill-rs/config.example.toml"
+
+	install -Dm644 packaging/man/killbilld.8    "${pkgdir}/usr/share/man/man8/killbilld.8"
+	install -Dm644 packaging/man/killbillctl.1  "${pkgdir}/usr/share/man/man1/killbillctl.1"
+	install -Dm644 packaging/man/killbill-tui.1 "${pkgdir}/usr/share/man/man1/killbill-tui.1"
+	install -Dm644 packaging/man/killbill.conf.5 "${pkgdir}/usr/share/man/man5/killbill.conf.5"
+
+	install -Dm644 LICENSE   "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+	install -Dm644 README.md "${pkgdir}/usr/share/doc/${pkgname}/README.md"
+	install -Dm644 CHANGELOG.md "${pkgdir}/usr/share/doc/${pkgname}/CHANGELOG.md"
+}

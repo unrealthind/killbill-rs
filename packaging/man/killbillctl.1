@@ -1,0 +1,148 @@
+.TH KILLBILLCTL 1 "2026-09-09" "killbill-rs 0.1.0" "User Commands"
+.SH NAME
+killbillctl \- command-line client for the killbill-rs daemon
+.SH SYNOPSIS
+.B killbillctl
+.RB [ \-\-socket
+.IR PATH ]
+.I COMMAND
+.RI [ ARGS ]
+.SH DESCRIPTION
+.B killbillctl
+is the dependable, scriptable path to
+.BR killbilld (8):
+everything the
+.BR killbill-tui (1)
+client can do, the CLI can do. It is a pure client of the control protocol over
+the
+.B SOCK_SEQPACKET
+Unix socket and never touches the config file or daemon state directly.
+.PP
+State-changing commands require
+.B uid 0
+on the connecting process (the socket is mode
+.B 0660
+owned
+.BR root:root ).
+.SH GLOBAL OPTIONS
+.TP
+.BR \-s ", " \-\-socket " " \fIPATH\fR
+Path to the daemon's control socket. Default:
+.IR /run/killbilld.sock .
+.TP
+.BR \-h ", " \-\-help
+Print help. Works after a subcommand too.
+.TP
+.BR \-V ", " \-\-version
+Print version.
+.SH COMMANDS
+.TP
+.B status
+Print armed state, dry-run flag, power action, sensor health, the sticky
+events-lost flag, whitelist and tracked-device counts, and config health
+.RB ( ok ", " "CONFIG INVALID" ", " STALE ).
+.TP
+.B devices
+List the USB devices the daemon is currently tracking. (v1 sees only devices
+added since the daemon started.)
+.TP
+.B arm
+Raise protection. Refused, loudly, if the config is invalid, the sensor is not
+running, or a sensor gap was reported under
+.BR "on_sensor_gap = warn" .
+.TP
+.B disarm
+Lower protection. Logged. This is the
+.I only
+way to disarm \(en signals never do.
+.TP
+.B test
+Dry-run the policy against the currently connected devices and print what would
+fire. Touches nothing.
+.TP
+.B reload
+Re-read and re-validate
+.IR /etc/killbill/config.toml .
+On failure the running config and armed state are kept.
+.TP
+.B whitelist list
+Print the whitelist.
+.TP
+.B whitelist add \fIID\fR [\fB\-\-label\fR \fISTRING\fR] [\fB\-\-max-count\fR \fIN\fR]
+Add or replace (upsert by
+.IR ID )
+a whitelist entry.
+.I ID
+is
+.I vvvv:pppp
+lowercase hex, as
+.BR lsusb (8)
+prints. Default
+.B --max-count
+is 1.
+.TP
+.B whitelist remove \fIID\fR
+Remove the entry with this id.
+.TP
+.B config show
+Print the running (validated) configuration.
+.TP
+.B config set dry-run \fB<on|off>\fR
+.TQ
+.B config set power-action \fB<poweroff|halt|none>\fR
+.TQ
+.B config set armed-at-boot \fB<on|off>\fR
+.TQ
+.B config set sensors \fINAME\fR...
+.TQ
+.B config set on-sensor-gap \fB<warn|kill>\fR
+Change one field. The daemon re-validates the
+.I whole
+config and writes nothing unless it passes \(en a change that would make the
+config invalid is rejected and neither written nor applied.
+.TP
+.B luks engage \fB<on|off>\fR
+Engage or disengage LUKS header destruction on a future kill. This is the
+.I runtime
+opt-in, layered on top of the config-time
+.B i_understand_this_is_irreversible
+acknowledgment \(en neither alone is enough. Refused unless
+.B [response.luks_destroy]
+is configured and acknowledged. The wipe itself is a stub in v1.
+.TP
+.B events \fR[\fB\-\-follow\fR]
+Print the daemon's event backlog (the last 200 events), then exit. With
+.BR \-\-follow ,
+keep streaming live events until interrupted.
+.SH EXIT STATUS
+.TP
+.B 0
+The command succeeded.
+.TP
+.B 1
+The command failed (daemon unreachable, request refused, invalid argument).
+The reason is printed to standard error.
+.SH EXAMPLES
+.PP
+Set up and arm, safely:
+.PP
+.nf
+sudo killbillctl whitelist add 1050:0407 --label "YubiKey 5C"
+killbillctl test
+sudo killbillctl config set dry-run on
+sudo killbillctl arm
+killbillctl status
+.fi
+.PP
+Watch the daemon's decisions live:
+.PP
+.nf
+killbillctl events --follow
+.fi
+.SH SEE ALSO
+.BR killbilld (8),
+.BR killbill-tui (1),
+.BR killbill.conf (5)
+.SH BUGS
+Report issues at
+.IR https://github.com/unrealthind/killbill-rs/issues .

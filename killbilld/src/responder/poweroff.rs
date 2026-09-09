@@ -159,10 +159,12 @@ fn invoke(power: PowerAction) {
     // SysRq write or the halt from being attempted (the C1 reasoning, carried
     // through). SysRq (`/proc/sysrq-trigger` <- 'o') is a typed constant write,
     // not a shelled command (invariant 6); it needs `kernel.sysrq` to permit
-    // it and Phase 3's `ProtectKernelTunables=` will remount it read-only —
-    // both tracked in the packaging work. When `power` was `Halt`, the halt
-    // retry below repeats the call that just failed; harmless, and there is no
-    // SysRq halt to escalate to.
+    // it. The shipped systemd unit deliberately sets `ProtectKernelTunables=no`
+    // and does NOT set `ProcSubset=pid`, precisely so this write stays
+    // reachable — do not "harden" either back without moving this fallback to
+    // a mechanism that survives it. When `power` was `Halt`, the halt retry
+    // below repeats the call that just failed; harmless, and there is no SysRq
+    // halt to escalate to.
     let Err(reboot_errno) = reboot(mode);
     let sysrq = std::fs::write("/proc/sysrq-trigger", b"o");
     let Err(halt_errno) = reboot(RebootMode::RB_HALT_SYSTEM);

@@ -30,6 +30,13 @@ pub(crate) fn help_line_count() -> u16 {
     help::line_count()
 }
 
+/// Total lines the LUKS-destroy screen renders for the current state — the
+/// reducer clamps `destroy_scroll` to it. Dynamic (depends on config + conn),
+/// so unlike [`help_line_count`] it needs the `App`.
+pub(crate) fn destroy_line_count<C: crate::client::Client>(app: &App<C>) -> u16 {
+    destroy::line_count(app)
+}
+
 /// Below this the layout can't be trusted; show a single message instead
 /// (plan §9).
 const MIN_W: u16 = 60;
@@ -176,7 +183,7 @@ fn screen_hint(app: &App) -> String {
         Screen::EventLog => "m menu · ↑↓ scroll · p follow/pause · esc back".to_owned(),
         Screen::Config => "m menu · r refresh · esc back".to_owned(),
         Screen::Help => "m menu · ↑↓ scroll · esc back".to_owned(),
-        Screen::Destroy => "m menu · enter: change engaged state · esc back".to_owned(),
+        Screen::Destroy => "m menu · ↑↓ scroll · enter: change engaged state · esc back".to_owned(),
     }
 }
 

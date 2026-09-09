@@ -3,7 +3,13 @@ name = "killbill-proto"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 description = "Shared wire vocabulary for killbill-rs: sensor events, actions, control protocol."
+publish = false
 
 [dependencies]
 serde = { workspace = true }

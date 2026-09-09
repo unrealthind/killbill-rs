@@ -4,10 +4,9 @@
 //! can be unit-tested without spawning a process, opening a socket, or touching
 //! hardware (charter §7.1). `main.rs` is a thin shell over this crate.
 //!
-//! Build order (see `CLAUDE.md`): steps 1–3 are config load and fail-closed
-//! validation and the pure policy engine; step 4 adds the responders; step 5
-//! the USB sensor; step 6 the control server ([`control`]) and the runtime
-//! wiring ([`daemon`]).
+//! Build order: config load and fail-closed validation and the pure policy
+//! engine first; then the responders; then the USB sensor; then the control
+//! server ([`control`]) and the runtime wiring ([`daemon`]).
 //!
 //! [`control`] and [`daemon`] are `#[cfg(unix)]` — the control transport is a
 //! `SOCK_SEQPACKET` Unix socket, a third genuinely OS-bound piece alongside the

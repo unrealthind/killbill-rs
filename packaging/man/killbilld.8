@@ -1,0 +1,148 @@
+.TH KILLBILLD 8 "2026-09-09" "killbill-rs 0.1.0" "System Administration"
+.SH NAME
+killbilld \- event-driven USB-kill daemon
+.SH SYNOPSIS
+.B killbilld
+.RB [ \-c
+.IR PATH ]
+.RB [ \-s
+.IR PATH ]
+.br
+.B killbilld
+.RB [ \-h | \-V ]
+.SH DESCRIPTION
+.B killbilld
+watches USB add and remove events on the kernel
+.B NETLINK_KOBJECT_UEVENT
+socket. While
+.B armed
+and an unauthorized device change occurs, it powers the machine off immediately
+so that a LUKS-encrypted disk re-locks and its contents become inaccessible.
+.PP
+The daemon is the single authority: it owns the configuration, the armed state,
+and all writes to the config file. The
+.BR killbillctl (1)
+CLI and
+.BR killbill-tui (1)
+client drive it over a local
+.B SOCK_SEQPACKET
+Unix socket; they never edit the config directly.
+.PP
+.B killbilld
+does not fork or daemonize. Run it under systemd (see
+.B FILES
+below for the shipped unit). It reads its config, starts the USB sensor and the
+control server, and \(en only if
+.B armed_at_boot
+is set \(en arms.
+.SH OPTIONS
+.TP
+.BR \-c ", " \-\-config " " \fIPATH\fR
+Configuration file. Default:
+.IR /etc/killbill/config.toml .
+.TP
+.BR \-s ", " \-\-socket " " \fIPATH\fR
+Control socket path. Default:
+.IR /run/killbilld.sock .
+The daemon refuses to start if the socket's parent directory is writable by
+group or other without the sticky bit set: the socket's mode and owner are
+applied by path after
+.BR bind (2),
+so a writable parent is a symlink-swap window on that step.
+.TP
+.BR \-h ", " \-\-help
+Print help and exit.
+.TP
+.BR \-V ", " \-\-version
+Print version and exit.
+.SH ARMING AND DISARMING
+Arming and disarming are
+.B control-socket commands
+.RB ( "killbillctl arm" ", " "killbillctl disarm" "), never signals."
+This is deliberate: the original
+.I usbkill
+could be disarmed by anyone able to send it
+.BR SIGTERM .
+Here, a signal means only "stop the process" and never lowers protection.
+.PP
+Arming runs a preflight and
+.B refuses
+(loudly, leaving the daemon disarmed) if it cannot guarantee the kill path:
+an invalid config, a USB sensor that will not start, a reported event gap under
+.BR "on_sensor_gap = \(dqwarn\(dq" ,
+or a missing
+.B CAP_SYS_BOOT
+capability.
+.SH SIGNALS
+.TP
+.BR SIGTERM ", " SIGINT
+Shut the process down. Any USB event already queued is evaluated first, so a
+signal racing an unplug still fires. Neither signal disarms.
+.PP
+If a poweroff is already in flight when a signal or shutdown arrives, the
+process
+.B parks and does not exit
+\(en the machine is going down. The shipped systemd unit sets
+.B SendSIGKILL=no
+so systemd cannot cut this short.
+.SH EXIT STATUS
+.TP
+.B 0
+Clean shutdown.
+.TP
+.B non-zero
+The USB sensor could not be kept alive, or every poweroff path failed with the
+machine still up. A supervisor (systemd
+.BR Restart=on-failure ) should restart the daemon. Armed state is never
+persisted across a restart; only
+.B armed_at_boot
+re-arms.
+.SH SECURITY
+The daemon needs
+.B CAP_SYS_BOOT
+(for
+.BR reboot (2))
+and write access to
+.IR /etc/killbill .
+It must
+.B not
+be granted
+.BR CAP_NET_ADMIN :
+receiving kernel uevents needs no capability, and holding
+.B CAP_NET_ADMIN
+would allow forging them. The control socket is mode
+.B 0660
+owned
+.BR root:root .
+An invalid configuration disables protection loudly; the daemon never fires on a
+half-understood config.
+.PP
+There is no network activity and no telemetry of any kind. The only IPC is the
+local Unix socket.
+.SH FILES
+.TP
+.I /etc/killbill/config.toml
+Configuration. See
+.BR killbill.conf (5).
+.TP
+.I /run/killbilld.sock
+Control socket.
+.TP
+.I /usr/lib/systemd/system/killbilld.service
+The systemd unit (hardened: minimal capability set,
+.BR ProtectSystem=full ,
+.BR SendSIGKILL=no ).
+.SH SEE ALSO
+.BR killbillctl (1),
+.BR killbill-tui (1),
+.BR killbill.conf (5),
+.BR systemd.exec (5)
+.PP
+Project home:
+.I https://github.com/unrealthind/killbill-rs
+.SH BUGS
+Report issues at
+.IR https://github.com/unrealthind/killbill-rs/issues .
+For security-sensitive reports see
+.I SECURITY.md
+in the source tree.

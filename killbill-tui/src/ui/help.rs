@@ -8,7 +8,7 @@
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
 use crate::app::App;
@@ -27,7 +27,7 @@ const SECTIONS: &[(&str, &[(&str, &str)])] = &[
                 "r",
                 "refresh this screen — or retry while the daemon is down",
             ),
-            ("q", "quit now (this never disarms the daemon)"),
+            ("q  (Ctrl-C)", "quit now (this never disarms the daemon)"),
         ],
     ),
     (
@@ -70,10 +70,16 @@ const SECTIONS: &[(&str, &[(&str, &str)])] = &[
     ),
     (
         "LUKS destroy",
-        &[(
-            "Enter",
-            "start the typed-DESTROY fence to engage / disengage",
-        )],
+        &[
+            (
+                "Enter",
+                "start the typed-DESTROY fence to engage / disengage",
+            ),
+            (
+                "↑ / ↓",
+                "scroll — the screen is taller than a small terminal",
+            ),
+        ],
     ),
 ];
 
@@ -88,7 +94,11 @@ const MENU_NOTES: &[&str] = &[
 
 /// The number of lines [`render`] builds, so the reducer can bound
 /// `App::help_scroll` (a `Paragraph` scrolled past its content just shows
-/// blank). Kept in step with `render` by hand — same as the key list itself.
+/// blank). `render` does **not** wrap — one logical line is one rendered row,
+/// so this count is exact and the clamp reaches the last row (a long
+/// description clips at the right edge on a very narrow terminal; the key
+/// column, on the left, always shows). Kept in step with `render` by hand —
+/// same as the key list itself.
 pub fn line_count() -> u16 {
     let mut n: u16 = 1; // title
     for (_, keys) in SECTIONS {
@@ -128,8 +138,42 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(
         Paragraph::new(lines)
             .block(Block::default().borders(Borders::ALL).title(" Help "))
-            .wrap(Wrap { trim: true })
             .scroll((app.help_scroll, 0)),
         area,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Rebuild the line list exactly as [`render`] does (minus the styling) and
+    /// assert [`line_count`] matches it. Since `render` no longer wraps, this
+    /// count is the real rendered-row count and the `help_scroll` clamp reaches
+    /// the last row.
+    #[test]
+    fn line_count_matches_the_rows_render_builds() {
+        let mut n: u16 = 1; // title
+        for (_, keys) in SECTIONS {
+            n += 1; // blank
+            n += 1; // heading
+            n += keys.len() as u16;
+        }
+        n += 1; // blank before the notes
+        n += MENU_NOTES.len() as u16;
+        n += 1; // blank before the footer
+        n += 1; // footer
+        assert_eq!(line_count(), n);
+    }
+
+    /// Ctrl-C must appear in the reference (tui-ux S4) — raw mode makes it
+    /// non-obvious that it is handled at all.
+    #[test]
+    fn the_everywhere_section_documents_ctrl_c() {
+        let (_, everywhere) = SECTIONS[0];
+        assert!(
+            everywhere.iter().any(|(k, _)| k.contains("Ctrl-C")),
+            "Ctrl-C quit is undocumented"
+        );
+    }
 }

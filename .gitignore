@@ -1,14 +1,14 @@
-# --- Assistant / Claude working files ------------------------------------
-# Intentionally NOT ignored and tracked: CLAUDE.md, PROJECT_CHARTER.md
+# --- Local development / editor working files --------------------------
+# Not tracked: contributor-facing docs live in CONTRIBUTING.md and
+# docs/DESIGN-NOTES.md; PROJECT_CHARTER.md is the tracked source of truth.
 .claude/
 .claude-*/
 CLAUDE.local.md
 CLAUDE.*.md
 AGENTS.md
 working.md
-# Review/audit write-ups are working notes, not project documentation. What
-# they conclude belongs in CLAUDE.md's "Current state"; the report itself does
-# not go into history.
+# Local review / audit write-ups are working notes, not project history. What
+# they conclude belongs in the charter's or the changelog's record.
 AUDIT-*.md
 audit-*.md
 .aider*
@@ -16,17 +16,30 @@ audit-*.md
 .mcp.json
 *.claude.md
 
-# --- Local test artifacts (Phase 2 plan step 0) --------------------------
-# Throwaway daemon configs for the Phase 1 hardware gate, never installed.
+# --- Local test artifacts --------------------------------------------
+# Throwaway daemon configs for hardware testing, never installed.
 /test-config.toml
 /test-config-live.toml
 
-# --- Rust ---------------------------------------------------------------
+# --- Rust -----------------------------------------------------------
 /target/
 **/target/
 Cargo.lock.orig
 *.rs.bk
 *.pdb
+
+# --- Packaging build output --------------------------------------
+*.deb
+*.rpm
+*.tar.gz
+*.tar.zst
+*.pkg.tar.*
+/SHA256SUMS
+*.minisig
+/dist/
+packaging/aur/*.tar.gz
+packaging/aur/pkg/
+packaging/aur/src/
 
 # --- Editor / OS -------------------------------------------------------
 .DS_Store

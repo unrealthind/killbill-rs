@@ -87,6 +87,63 @@ pub fn sanitize_device_string(s: &str) -> String {
         .collect()
 }
 
+/// Ceiling on the *content* of any operator-facing report string that crosses
+/// the control socket — a config `ValidationReport`, a reload-failure reason. A
+/// `ValidationReport` collects *every* problem in the file and is unbounded in
+/// principle (a config with hundreds of malformed entries); 4 KiB is far more
+/// than a real report and well under [`MAX_CONTROL_FRAME`]. A truncated return
+/// then carries a short trailing note, so [`cap_report`] / [`sanitize_report`]
+/// can return up to `MAX_REPORT_LEN + 64` bytes — still far inside the frame.
+pub const MAX_REPORT_LEN: usize = 4096;
+
+/// Cap a multi-line diagnostic string (a config validation report, a
+/// reload-failure reason) at [`MAX_REPORT_LEN`] on a UTF-8 boundary, appending a
+/// short note when it truncates.
+///
+/// This does **not** alter the characters: a `ValidationReport` and the daemon's
+/// own composed prose are trusted, escape-safe text (every interpolated value
+/// formats with `{:?}`) and legitimately contain non-ASCII — em dashes, `§`.
+/// Only length is a concern for them. For the one string that is *not* trusted —
+/// a raw TOML parse error echoing a source line from the config file — use
+/// [`sanitize_report`], which scrubs first.
+#[must_use]
+pub fn cap_report(s: &str) -> String {
+    if s.len() <= MAX_REPORT_LEN {
+        return s.to_owned();
+    }
+    let mut cut = MAX_REPORT_LEN;
+    while !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let mut out = s[..cut].to_owned();
+    out.push_str("\n[report truncated — fix the errors shown above and re-check]");
+    out
+}
+
+/// Scrub an **untrusted** diagnostic string for an operator's terminal, then cap
+/// it with [`cap_report`].
+///
+/// Like [`sanitize_device_string`] this is an **allowlist** — printable ASCII
+/// plus space, and additionally newline and tab which a report legitimately
+/// uses; everything else becomes U+FFFD. The only report string that needs this
+/// is a raw TOML *parse* error: it echoes a source line from the config file
+/// verbatim and can carry a stray escape byte or a bidi override. A
+/// `ValidationReport` is already escape-safe — cap it with [`cap_report`]
+/// instead, so its legitimate non-ASCII survives. A denylist here would have the
+/// same un-completable shape the [`sanitize_device_string`] doc describes.
+#[must_use]
+pub fn sanitize_report(s: &str) -> String {
+    let scrubbed: String = s
+        .chars()
+        .map(|c| match c {
+            '\n' | '\t' => c,
+            c if c.is_ascii_graphic() || c == ' ' => c,
+            _ => '\u{fffd}',
+        })
+        .collect();
+    cap_report(&scrubbed)
+}
+
 /// Snapshot of daemon state, returned by `GetStatus`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StatusPayload {
@@ -769,6 +826,56 @@ mod tests {
             .chars()
             .count();
         assert_eq!(n, MAX_DEVICE_STRING);
+    }
+
+    #[test]
+    fn sanitize_report_keeps_layout_but_scrubs_hostile_bytes() {
+        let dirty = "bad key on line 3:\n\tfoo = \u{1b}[2J\u{202e}bar\u{200b}\r\n";
+        let clean = sanitize_report(dirty);
+        // Newlines and tabs — a report's real structure — survive.
+        assert!(clean.contains("bad key on line 3:\n\tfoo = "));
+        // Escape, bidi override, zero-width, and the bare CR do not.
+        assert!(!clean.contains('\u{1b}'));
+        assert!(!clean.contains('\u{202e}'));
+        assert!(!clean.contains('\u{200b}'));
+        assert!(!clean.contains('\r'));
+        assert!(clean.contains('\u{fffd}'));
+    }
+
+    #[test]
+    fn cap_report_cuts_on_a_char_boundary_with_a_multibyte_char_astride_the_limit() {
+        // Fill exactly to the limit, then push a 3-byte char so the naive cut
+        // would land mid-character.
+        // `Z` is the past-the-cap sentinel — it must not collide with anything
+        // `cap_report` itself emits (the truncation note included).
+        let mut s = "a".repeat(MAX_REPORT_LEN - 1);
+        s.push('€'); // 3 bytes: pushes the fill across MAX_REPORT_LEN
+        s.push_str(&"Z".repeat(100));
+        let out = cap_report(&s);
+        // The cut landed before the `€`, not inside it: the last kept content
+        // char is an `a`, and nothing past the cap survived.
+        assert!(out.starts_with(&"a".repeat(MAX_REPORT_LEN - 1)));
+        assert!(
+            !out.contains('€'),
+            "the multibyte char straddling the cap was dropped whole"
+        );
+        assert!(!out.contains('Z'), "content past the cap must be gone");
+        assert!(out.ends_with("re-check]"));
+        assert!(out.len() <= MAX_REPORT_LEN + 64);
+    }
+
+    #[test]
+    fn cap_report_preserves_legitimate_non_ascii_in_a_trusted_report() {
+        // A real validation message: em dash, section sign. `cap_report` must
+        // not mangle these — only `sanitize_report` (for untrusted echoes) does.
+        let s = "detection.sensors is empty — nothing would be watched (see §9)";
+        assert_eq!(cap_report(s), s);
+    }
+
+    #[test]
+    fn sanitize_report_leaves_a_short_clean_string_untouched() {
+        let s = "response.power_action: unknown value \"powerof\"\nexpected one of: poweroff, halt, none";
+        assert_eq!(sanitize_report(s), s);
     }
 
     #[test]

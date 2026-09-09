@@ -53,8 +53,8 @@ const DESTROY_WORD: &str = "DESTROY";
 /// an over-long typo simply stops accepting characters rather than scrolling.
 const DESTROY_WORD_INPUT_MAX: usize = 12;
 
-/// One `↑`/`↓` step on the Help screen, in lines.
-const HELP_SCROLL_STEP: u16 = 1;
+/// One `↑`/`↓` step on a scrolling read screen (Help, LUKS destroy), in lines.
+const SCROLL_STEP: u16 = 1;
 
 /// Connection state, as reported by the background event thread.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -328,6 +328,9 @@ pub struct App<C: Client = ClientHandle> {
     pub events_paused: bool,
     /// Lines the Help screen is scrolled down from the top.
     pub help_scroll: u16,
+    /// Lines the LUKS-destroy screen is scrolled down from the top. Reset to 0
+    /// whenever that screen is (re-)entered from the menu.
+    pub destroy_scroll: u16,
 
     /// The `vendor:product` string being typed in [`Modal::WhitelistAddId`].
     pub input: String,
@@ -341,6 +344,18 @@ pub struct App<C: Client = ClientHandle> {
 
     pub toast: Option<(String, Instant)>,
     pub should_quit: bool,
+
+    // Set by `on_event`, serviced once per render-loop tick by `settle()`
+    // instead of a socket round-trip per event. A backlog-replay burst (up to
+    // ~200 events the moment we subscribe) would otherwise fire ~400–600 fresh
+    // `SOCK_SEQPACKET` connections back to back on the same control FIFO the
+    // daemon services the kill decision on — bounded, but it adds latency there
+    // and hangs the UI while it grinds. Private: only `on_event` sets, only
+    // `settle` clears.
+    dirty_status: bool,
+    dirty_devices: bool,
+    dirty_whitelist: bool,
+    dirty_config: bool,
 }
 
 impl<C: Client> App<C> {
@@ -365,10 +380,15 @@ impl<C: Client> App<C> {
             event_scroll: 0,
             events_paused: false,
             help_scroll: 0,
+            destroy_scroll: 0,
             input: String::new(),
             destroy_target: None,
             toast: None,
             should_quit: false,
+            dirty_status: false,
+            dirty_devices: false,
+            dirty_whitelist: false,
+            dirty_config: false,
         }
     }
 
@@ -553,7 +573,11 @@ impl<C: Client> App<C> {
             }
             Screen::EventLog => {
                 if delta < 0 {
-                    self.event_scroll = (self.event_scroll + 1).min(self.events.len());
+                    // Cap at `len - 1`, not `len`: scrolled all the way to
+                    // `len` the viewport window is empty and the screen goes
+                    // blank past the oldest line. Keep the oldest line visible.
+                    self.event_scroll =
+                        (self.event_scroll + 1).min(self.events.len().saturating_sub(1));
                     self.events_paused = true;
                 } else {
                     self.event_scroll = self.event_scroll.saturating_sub(1);
@@ -564,16 +588,30 @@ impl<C: Client> App<C> {
             }
             Screen::Help => {
                 if delta < 0 {
-                    self.help_scroll = self.help_scroll.saturating_sub(HELP_SCROLL_STEP);
+                    self.help_scroll = self.help_scroll.saturating_sub(SCROLL_STEP);
                 } else {
                     // Don't scroll past the content into blank space — a
                     // `Paragraph` offset has no natural ceiling.
                     let max = crate::ui::help_line_count().saturating_sub(1);
-                    self.help_scroll = (self.help_scroll + HELP_SCROLL_STEP).min(max);
+                    self.help_scroll = (self.help_scroll + SCROLL_STEP).min(max);
+                }
+            }
+            Screen::Destroy => {
+                // The fenced screen is taller than a small terminal; at MIN_H
+                // the stub disclaimer and the "press Enter to ENGAGE" hint fall
+                // off the bottom. Same bounded-offset scroll as Help — the
+                // `destroy::body_lines` count is dynamic (config + conn) and
+                // pre-wrapped so logical lines == rendered rows, so it takes
+                // the whole `App`.
+                if delta < 0 {
+                    self.destroy_scroll = self.destroy_scroll.saturating_sub(SCROLL_STEP);
+                } else {
+                    let max = crate::ui::destroy_line_count(self).saturating_sub(1);
+                    self.destroy_scroll = (self.destroy_scroll + SCROLL_STEP).min(max);
                 }
             }
             // Read-only, single-action, or non-scrolling screens.
-            Screen::Config | Screen::Destroy | Screen::DryRun => {}
+            Screen::Config | Screen::DryRun => {}
         }
     }
 
@@ -653,6 +691,7 @@ impl<C: Client> App<C> {
             }
             MenuItem::LuksDestroy => {
                 self.screen = Screen::Destroy;
+                self.destroy_scroll = 0;
                 // Always work from a fresh snapshot — `engaged` is never
                 // persisted and another client may have just changed it.
                 self.refresh_config();
@@ -1021,51 +1060,75 @@ impl<C: Client> App<C> {
 
     /// A daemon-pushed event, with the daemon's own RFC 3339 timestamp
     /// (`se.at`). Recorded in the event-log ring first, then reduced.
+    ///
+    /// Reducing an event only marks *what* needs re-fetching — the actual
+    /// socket round-trips happen once per render tick in [`settle`], so a
+    /// backlog-replay burst costs one fetch of each kind, not one per event.
+    /// Toasts are set inline: they touch no socket.
     pub fn on_event(&mut self, se: StreamEvent) {
         self.record_event(se.clone());
         match se.event {
             Event::DeviceAdded(_) | Event::DeviceRemoved(_) => {
-                self.refresh_devices();
-                self.refresh_status();
+                self.dirty_devices = true;
+                self.dirty_status = true;
             }
             Event::Armed => {
                 self.set_toast("Armed");
-                self.refresh_status();
+                self.dirty_status = true;
             }
             Event::Disarmed => {
                 self.set_toast("Disarmed");
-                self.refresh_status();
+                self.dirty_status = true;
             }
             Event::WouldKill(reason) => self.set_toast(format!("would kill: {reason}")),
             Event::SensorStopped => {
                 self.set_toast("USB sensor stopped — daemon is no longer watching");
-                self.refresh_status();
+                self.dirty_status = true;
             }
             Event::EventsLost => {
                 self.set_toast("USB events lost — some device changes were missed");
-                self.refresh_status();
+                self.dirty_status = true;
             }
             Event::WhitelistChanged => {
                 // `DeviceInfo.whitelisted` and the Whitelist screen are both
                 // derived from it; re-fetch everything it touches (this
                 // client's change or another's).
                 self.set_toast("whitelist changed");
-                self.refresh_devices();
-                self.refresh_whitelist();
-                self.refresh_status();
+                self.dirty_devices = true;
+                self.dirty_whitelist = true;
+                self.dirty_status = true;
             }
             Event::ConfigChanged => {
                 self.set_toast("config changed");
-                self.refresh_config();
-                self.refresh_status();
+                self.dirty_config = true;
+                self.dirty_status = true;
             }
             Event::ReloadFailed(reason) => {
                 self.set_toast(format!("reload failed: {reason}"));
-                self.refresh_status();
+                self.dirty_status = true;
             }
             // `Event` is `#[non_exhaustive]`: a newer daemon may push a variant
             // this build predates. Surface it rather than silently drop it.
             other => self.set_toast(format!("event: {other:?}")),
+        }
+    }
+
+    /// Service the dirty flags set since the last tick: at most one fetch of
+    /// each kind, no matter how many events asked for it. Called by the render
+    /// loop right after it drains the daemon-event channel. Order: status
+    /// first (cheapest, always wanted), then the screen data.
+    pub fn settle(&mut self) {
+        if std::mem::take(&mut self.dirty_status) {
+            self.refresh_status();
+        }
+        if std::mem::take(&mut self.dirty_devices) {
+            self.refresh_devices();
+        }
+        if std::mem::take(&mut self.dirty_whitelist) {
+            self.refresh_whitelist();
+        }
+        if std::mem::take(&mut self.dirty_config) {
+            self.refresh_config();
         }
     }
 
@@ -1076,8 +1139,10 @@ impl<C: Client> App<C> {
         }
         if matches!(self.screen, Screen::EventLog) {
             if self.events_paused {
-                // Keep the viewport visually stable as new lines push in below.
-                self.event_scroll = (self.event_scroll + 1).min(self.events.len());
+                // Keep the viewport visually stable as new lines push in below,
+                // with the same `len - 1` cap as the manual scroll above.
+                self.event_scroll =
+                    (self.event_scroll + 1).min(self.events.len().saturating_sub(1));
             } else {
                 self.event_scroll = 0;
             }
@@ -1312,21 +1377,33 @@ mod tests {
     }
 
     #[test]
-    fn armed_event_sets_a_toast_and_refreshes_status() {
+    fn armed_event_sets_a_toast_and_settle_refreshes_status() {
         let mut a = app(vec![Ok(Reply::Status(status(true)))]);
         a.on_event(stream_event(Event::Armed));
-        assert!(a.toast.is_some());
+        assert!(a.toast.is_some(), "the toast is set inline");
+        assert!(a.client.calls.is_empty(), "no fetch until settle");
+        a.settle();
         assert!(a.status.is_some_and(|s| s.armed));
     }
 
     #[test]
-    fn device_added_refreshes_devices_then_status_in_that_order() {
+    fn device_added_settles_to_one_status_then_one_devices_fetch() {
         let dev = device(Some(UsbId::new(0x1050, 0x0407)), false);
         let mut a = app(vec![
-            Ok(Reply::Devices(vec![dev])),
             Ok(Reply::Status(status(false))),
+            Ok(Reply::Devices(vec![dev])),
         ]);
         a.on_event(stream_event(Event::DeviceAdded(device(None, false))));
+        assert!(
+            a.client.calls.is_empty(),
+            "on_event never touches the socket"
+        );
+        a.settle();
+        // `settle`'s fixed order: status first, then the screen data.
+        assert_eq!(
+            a.client.calls,
+            vec![Command::GetStatus, Command::ListDevices]
+        );
         assert_eq!(a.devices.len(), 1);
         assert!(a.status.is_some());
     }
@@ -1337,8 +1414,36 @@ mod tests {
         a.on_event(stream_event(Event::ReloadFailed(
             "config on disk is invalid".to_owned(),
         )));
-        let (msg, _) = a.toast.expect("a toast was set");
+        let (msg, _) = a.toast.clone().expect("a toast was set");
         assert!(msg.contains("config on disk is invalid"), "got: {msg}");
+        a.settle();
+        assert_eq!(a.client.calls, vec![Command::GetStatus]);
+    }
+
+    #[test]
+    fn a_backlog_burst_coalesces_to_one_fetch_of_each_kind() {
+        let mut a = app(vec![
+            Ok(Reply::Status(status(false))),
+            Ok(Reply::Devices(Vec::new())),
+            Ok(Reply::Whitelist(Vec::new())),
+        ]);
+        for _ in 0..50 {
+            a.on_event(stream_event(Event::DeviceAdded(device(None, false))));
+            a.on_event(stream_event(Event::WhitelistChanged));
+        }
+        assert!(
+            a.client.calls.is_empty(),
+            "no socket traffic during the burst"
+        );
+        a.settle();
+        assert_eq!(
+            a.client.calls,
+            vec![
+                Command::GetStatus,
+                Command::ListDevices,
+                Command::WhitelistList
+            ]
+        );
     }
 
     #[test]
@@ -1523,11 +1628,12 @@ mod tests {
     fn whitelist_changed_event_refreshes_devices_whitelist_and_status() {
         let dev = device(Some(UsbId::new(0x1050, 0x0407)), true);
         let mut a = app(vec![
+            Ok(Reply::Status(status(false))),
             Ok(Reply::Devices(vec![dev])),
             Ok(Reply::Whitelist(vec![wl(UsbId::new(0x1050, 0x0407), 1)])),
-            Ok(Reply::Status(status(false))),
         ]);
         a.on_event(stream_event(Event::WhitelistChanged));
+        a.settle();
         assert_eq!(a.devices.len(), 1);
         assert_eq!(a.whitelist.len(), 1);
         assert!(a.status.is_some());
@@ -1762,15 +1868,14 @@ mod tests {
 
     #[test]
     fn the_event_log_ring_records_every_event_and_caps_its_length() {
-        let replies: Vec<anyhow::Result<Reply>> =
-            std::iter::repeat_with(|| Ok(Reply::Status(status(false))))
-                .take(EVENT_LOG_CAP + 50)
-                .collect();
-        let mut a = app(replies);
+        // `on_event` only records + marks dirty now — no socket, no scripted
+        // replies needed.
+        let mut a = app(vec![]);
         for _ in 0..EVENT_LOG_CAP + 50 {
             a.on_event(stream_event(Event::Armed));
         }
         assert_eq!(a.events.len(), EVENT_LOG_CAP);
+        assert!(a.client.calls.is_empty());
     }
 
     #[test]
@@ -1784,6 +1889,19 @@ mod tests {
         a.handle(Intent::Down);
         assert_eq!(a.event_scroll, 0);
         assert!(!a.events_paused);
+    }
+
+    #[test]
+    fn event_log_scroll_stops_at_the_oldest_line() {
+        let mut a = app(vec![]);
+        a.screen = Screen::EventLog;
+        a.events = (0..5).map(|_| stream_event(Event::Armed)).collect();
+        for _ in 0..100 {
+            a.handle(Intent::Up);
+        }
+        // Capped at `len - 1` so the oldest line stays on screen, never a
+        // blank window past it.
+        assert_eq!(a.event_scroll, 4);
     }
 
     #[test]
@@ -2040,5 +2158,23 @@ mod tests {
         }
         assert!(a.help_scroll > 0);
         assert!(a.help_scroll < crate::ui::help_line_count());
+    }
+
+    #[test]
+    fn destroy_screen_scrolls_and_clamps_to_the_content() {
+        let mut a = app(vec![]);
+        a.conn = Conn::Up;
+        a.screen = Screen::Destroy;
+        a.config = Some(config_with_luks(false));
+        for _ in 0..10_000 {
+            a.handle(Intent::Down);
+        }
+        let count = crate::ui::destroy_line_count(&a);
+        assert!(a.destroy_scroll > 0, "it scrolled");
+        assert!(
+            a.destroy_scroll < count,
+            "scroll {} stays under the {count}-line body",
+            a.destroy_scroll
+        );
     }
 }

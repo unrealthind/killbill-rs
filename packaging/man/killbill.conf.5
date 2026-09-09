@@ -1,0 +1,207 @@
+.TH KILLBILL.CONF 5 "2026-09-09" "killbill-rs 0.1.0" "File Formats"
+.SH NAME
+killbill.conf, config.toml \- configuration for killbilld
+.SH SYNOPSIS
+.I /etc/killbill/config.toml
+.SH DESCRIPTION
+The
+.BR killbilld (8)
+daemon reads a single TOML file, by default
+.IR /etc/killbill/config.toml .
+The daemon owns writes to it:
+.BR killbillctl (1)
+and
+.BR killbill-tui (1)
+request changes and the daemon validates and persists them, so the running
+state and the file can never drift. A daemon-side write re-serializes the file
+and
+.B comments and formatting are lost;
+run
+.B killbillctl reload
+after editing by hand.
+.PP
+Validation is
+.BR "fail-closed" .
+The daemon collects
+.I every
+problem, reports them all, and
+.B refuses to arm
+until the file is valid.
+.B Any unrecognized key is a hard error
+\(en a typo disables protection loudly rather than being silently ignored.
+.SH SECTIONS
+.SS [general]
+.TP
+.B armed_at_boot
+Boolean, default
+.BR false .
+Arm automatically when the daemon starts. A fresh install ships this
+.B false
+so installation can never lock you out. Armed state is otherwise never
+persisted: after a crash or restart the daemon comes back disarmed unless this
+is set.
+.SS [detection]
+.TP
+.B sensors
+Array of strings, default
+.BR [\(dqusb\(dq] .
+Which sensors to run. v1 implements only
+.BR \(dqusb\(dq
+(kernel netlink uevents). The list is what makes the sensor layer pluggable; an
+unknown name is a validation error.
+.PP
+While armed, a root-issued synthetic removal uevent
+.RB ( "udevadm trigger --action=remove" )
+fires the power action for the affected device, exactly like a physical unplug.
+A synthetic
+.I add
+re-announcing an already-connected device is recorded but never acted on.
+.SS [[whitelist]]
+Repeat this block once per device allowed to be connected while armed.
+.TP
+.B id
+String, required. The USB
+.I vendor:product
+pair in lowercase hex, as
+.BR lsusb (8)
+prints \(en for example
+.BR \(dq1050:0407\(dq .
+Malformed ids are a validation error.
+.TP
+.B label
+String, optional. A human-readable name, shown in
+.B killbillctl
+output. Cosmetic only.
+.TP
+.B max_count
+Integer, default
+.BR 1 .
+How many copies of this
+.B id
+may be connected at once. A whitelisted device added beyond this count fires.
+.PP
+The whitelist suppresses
+.I additions
+you expect. It never makes a device safe to
+.IR remove :
+unplugging
+.B any
+device while armed fires, whitelisted or not \(en an unplug is the classic
+seizure signal.
+.SS [response]
+.TP
+.B dry_run
+Boolean, default
+.BR false .
+When true, a kill decision is logged and broadcast but no power action or
+destruction is performed. Use this first when setting up.
+.TP
+.B power_action
+String, default
+.BR \(dqpoweroff\(dq .
+One of:
+.RS
+.TP
+.B poweroff
+Cut power. The LUKS disk re-locks. This is the point of the tool.
+.TP
+.B halt
+Stop the CPU but leave power on. RAM keeps the LUKS master key and the disk
+never re-locks \(en weak against the seizure threat model. Use only if you know
+why.
+.TP
+.B none
+Detect and log only; take no power action.
+.RE
+.TP
+.B lock_screen_first
+Boolean, default
+.BR false .
+Must be
+.BR false .
+Setting it
+.B true
+makes the daemon
+.B refuse to arm:
+a pre-poweroff wait would delay the kill path, and a fire-and-forget lock never
+completes before power is cut. The LUKS re-lock already covers a seized machine.
+.TP
+.B on_sensor_gap
+String, default
+.BR \(dqwarn\(dq .
+What to do if the USB sensor loses events (kernel receive-buffer overflow, an
+unparseable datagram, or the sensor thread crashing) \(en for example a device
+storm meant to bury a real add or remove:
+.RS
+.TP
+.B warn
+Surface it in
+.B killbillctl status
+.RB ( events_lost )
+and refuse to (re)arm until the daemon is restarted.
+.TP
+.B kill
+Treat the gap as an unauthorized change and fire
+.BR power_action .
+A gap fires the power action
+.BR only ;
+it never triggers
+.B luks_destroy
+even when that is configured.
+.RE
+An unrecognized value is a hard validation error.
+.SS [response.luks_destroy]
+.B Absent by default and deliberately commented out in the shipped example.
+LUKS header destruction. In v1 the responder is a
+.B stub:
+it logs what it would do and
+.B wipes nothing.
+Enabling it still requires the spelled-out acknowledgment key below (there is no
+generic
+.BR "enabled = true" ), and the daemon refuses to arm unless the target resolves to a
+block device.
+.TP
+.B i_understand_this_is_irreversible
+Boolean. Must be
+.B true
+for the block to be accepted.
+.TP
+.B target_header
+String. An absolute path to a block device under
+.IR /dev .
+.PP
+There is a
+.I second,
+runtime opt-in on top of this:
+.B killbillctl luks engage on
+(or the TUI's fenced
+.B DESTROY
+screen). Both the config acknowledgment and the runtime engage must be set
+before a kill would invoke the (stubbed) destruction.
+.SH EXAMPLE
+.nf
+[general]
+armed_at_boot = false
+
+[detection]
+sensors = ["usb"]
+
+[[whitelist]]
+id = "1050:0407"
+label = "YubiKey 5C"
+max_count = 1
+
+[response]
+dry_run = true
+power_action = "poweroff"
+lock_screen_first = false
+on_sensor_gap = "warn"
+.fi
+.SH SEE ALSO
+.BR killbilld (8),
+.BR killbillctl (1),
+.BR killbill-tui (1),
+.BR lsusb (8)
+.PP
+A fully-commented reference config is installed at
+.IR /usr/share/killbill-rs/config.example.toml .

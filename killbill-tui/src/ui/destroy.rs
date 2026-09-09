@@ -17,11 +17,11 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::app::{App, Conn};
+use crate::client::Client;
 use crate::theme::Theme;
 
 pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     let t = &app.theme;
-    let bold = Style::default().add_modifier(Modifier::BOLD);
     let down = matches!(app.conn, Conn::Down);
 
     // The hazard frame is drawn regardless of state, so the screen is never
@@ -38,32 +38,51 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         .border_style(t.invalid())
         .title(Line::from(title));
 
-    let Some(cfg) = &app.config else {
-        frame.render_widget(
-            Paragraph::new("Loading config… press r to retry.")
-                .block(block)
-                .wrap(Wrap { trim: true }),
-            area,
-        );
-        return;
-    };
+    frame.render_widget(
+        Paragraph::new(body_lines(app))
+            .block(block)
+            // `body_lines` is pre-wrapped to `BODY_WRAP`, so at any width the
+            // layout accepts (>= `ui::MIN_W`) one logical line renders as one
+            // row — this `Wrap` only mops up a pathologically long target path.
+            // That equality is what lets the reducer clamp `destroy_scroll`
+            // against `line_count` (a logical count) even though
+            // `Paragraph::scroll` counts rendered rows.
+            .wrap(Wrap { trim: true })
+            .scroll((app.destroy_scroll, 0)),
+        area,
+    );
+}
 
+/// Wrap width for the scrolling body. `ui::MIN_W` (60) minus the double border
+/// and the two-space indent leaves ~56 columns; 54 keeps a margin (and
+/// multi-byte glyphs like `—` count as >1 byte here, wrapping a hair early,
+/// which only ever under-fills a line).
+const BODY_WRAP: usize = 54;
+
+/// The screen body as owned lines, already wrapped to [`BODY_WRAP`] so its
+/// length equals the rendered row count. Shared by [`render`] and
+/// [`line_count`] so the scroll clamp can never drift from what is drawn — the
+/// count is dynamic (a one-line "not configured" body, the full body, and a
+/// `Conn::Down` hint swap), so hand-counting like `help::line_count` would be
+/// fragile.
+fn body_lines<C: Client>(app: &App<C>) -> Vec<Line<'static>> {
+    let t = &app.theme;
+    let bold = Style::default().add_modifier(Modifier::BOLD);
+    let down = matches!(app.conn, Conn::Down);
+
+    let Some(cfg) = &app.config else {
+        return vec![Line::from("Loading config… press r to retry.")];
+    };
     let Some(luks) = &cfg.luks_destroy else {
         // Reachable only from a stale cache — the menu greys the item.
-        frame.render_widget(
-            Paragraph::new(
-                "LUKS header destruction is not configured. Add an acknowledged \
-                 [response.luks_destroy] block to the config file first.",
-            )
-            .block(block)
-            .wrap(Wrap { trim: true }),
-            area,
-        );
-        return;
+        return vec![Line::from(
+            "LUKS header destruction is not configured. Add an acknowledged \
+             [response.luks_destroy] block to the config file first.",
+        )];
     };
 
     let engaged = luks.engaged;
-    let mut lines: Vec<Line> = Vec::new();
+    let mut lines: Vec<Line<'static>> = Vec::new();
 
     lines.push(Line::from(""));
     lines.push(Line::from(vec![
@@ -80,7 +99,19 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     // daemon is unreachable we cannot vouch for the cached value, so it is
     // shown as UNKNOWN rather than as a stale "not engaged" (invariant 4:
     // the engaged state is never assumed).
-    lines.push(state_line(&app.conn, engaged, t));
+    lines.extend(state_lines(&app.conn, engaged, t));
+    lines.push(Line::from(""));
+
+    // One line stating the v1 stub *above the fold* — on an 18-row terminal the
+    // long prose below starts at/past the bottom edge, and the operator must not
+    // be able to reach the fence without having seen that engaging is inert
+    // today (invariant 3, plan §8). The full explanation still follows.
+    for row in wrap_words(
+        "v1: engaging records intent only — the LUKS header is never touched (the wipe is a stub).",
+        BODY_WRAP,
+    ) {
+        lines.push(Line::from(Span::styled(format!("  {row}"), bold)));
+    }
     lines.push(Line::from(""));
 
     for para in [
@@ -95,55 +126,84 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         "The flag is never saved to disk: every daemon restart begins with \
          destruction disengaged.",
     ] {
-        lines.push(Line::from(Span::raw(format!("  {para}"))));
+        for row in wrap_words(para, BODY_WRAP) {
+            lines.push(Line::from(Span::raw(format!("  {row}"))));
+        }
         lines.push(Line::from(""));
     }
 
-    if down {
+    let hint = if down {
         // The fence is refused while unreachable (see `App::open_destroy_fence`);
         // don't offer an action the daemon can't receive.
-        lines.push(Line::from(Span::styled(
-            "  reconnect to the daemon before changing the engaged state (r to retry)",
-            t.dim(),
-        )));
+        "reconnect to the daemon before changing the engaged state (r to retry)".to_owned()
     } else {
-        lines.push(Line::from(Span::styled(
-            format!(
-                "  ▸ press Enter to {} — you will be asked to type DESTROY",
-                if engaged { "DISENGAGE" } else { "ENGAGE" }
-            ),
-            bold,
-        )));
+        format!(
+            "▸ press Enter to {} — you will be asked to type DESTROY",
+            if engaged { "DISENGAGE" } else { "ENGAGE" }
+        )
+    };
+    let hint_style = if down { t.dim() } else { bold };
+    for row in wrap_words(&hint, BODY_WRAP) {
+        lines.push(Line::from(Span::styled(format!("  {row}"), hint_style)));
     }
 
-    frame.render_widget(
-        Paragraph::new(lines).block(block).wrap(Wrap { trim: true }),
-        area,
-    );
+    lines
 }
 
-/// The big colour-*and*-word engaged-state line. `Conn::Down` overrides the
-/// cached `engaged` value with UNKNOWN — a downed daemon may have changed it,
-/// and showing a stale "not engaged" on this screen is the one the review gate
-/// flagged as sharpest.
-fn state_line(conn: &Conn, engaged: bool, t: &Theme) -> Line<'static> {
-    if matches!(conn, Conn::Down) {
-        return Line::from(Span::styled(
-            "  ??  ENGAGED STATE UNKNOWN — daemon unreachable, cannot confirm  ??",
-            t.invalid(),
-        ));
+/// Lines [`render`] draws for the current [`App`] state — the reducer clamps
+/// `App::destroy_scroll` to this so a `Paragraph` offset can't run past the
+/// content into blank space.
+pub fn line_count<C: Client>(app: &App<C>) -> u16 {
+    body_lines(app).len() as u16
+}
+
+/// Word-wrap `text` to rows no wider than `width` (byte length, which
+/// over-counts multi-byte glyphs and so only wraps early). Keeps the body's
+/// logical line count equal to its rendered row count.
+fn wrap_words(text: &str, width: usize) -> Vec<String> {
+    let mut rows: Vec<String> = Vec::new();
+    let mut row = String::new();
+    for word in text.split_whitespace() {
+        if !row.is_empty() && row.len() + 1 + word.len() > width {
+            rows.push(std::mem::take(&mut row));
+        }
+        if !row.is_empty() {
+            row.push(' ');
+        }
+        row.push_str(word);
     }
-    if engaged {
-        Line::from(Span::styled(
-            "  ▓▓  ENGAGED — a kill while armed will (in a future version) wipe this header  ▓▓",
+    if !row.is_empty() {
+        rows.push(row);
+    }
+    rows
+}
+
+/// The big colour-*and*-word engaged-state block, pre-wrapped. `Conn::Down`
+/// overrides the cached `engaged` value with UNKNOWN — a downed daemon may have
+/// changed it, and showing a stale "not engaged" on this screen is the reading
+/// the review gate flagged as sharpest.
+fn state_lines(conn: &Conn, engaged: bool, t: &Theme) -> Vec<Line<'static>> {
+    // A glyph prefix carries the weight too, not colour alone (NO_COLOR).
+    let (words, style): (&str, Style) = if matches!(conn, Conn::Down) {
+        (
+            "??  ENGAGED STATE UNKNOWN — daemon unreachable",
             t.invalid(),
-        ))
+        )
+    } else if engaged {
+        (
+            "▓▓  ENGAGED — a kill while armed would, in a future release, wipe this header",
+            t.invalid(),
+        )
     } else {
-        Line::from(Span::styled(
-            "  ░░  not engaged — a kill will not touch the header  ░░",
+        (
+            "░░  not engaged — a kill will not touch the header",
             t.disarmed(),
-        ))
-    }
+        )
+    };
+    wrap_words(words, BODY_WRAP)
+        .into_iter()
+        .map(|row| Line::from(Span::styled(format!("  {row}"), style)))
+        .collect()
 }
 
 /// Step one of the fence: the `DESTROY` text field. Rendered centred over the
@@ -247,24 +307,98 @@ fn boxed(frame: &mut Frame, area: Rect, title: &str, lines: Vec<Line>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::ScriptedClient;
+    use killbill_proto::{ConfigPayload, LuksDestroyInfo, OnSensorGap, PowerAction};
 
     fn text(line: &Line) -> String {
         line.spans.iter().map(|s| s.content.as_ref()).collect()
     }
 
+    fn app_with_luks() -> App<ScriptedClient> {
+        let mut a = App::new(ScriptedClient::new(vec![]));
+        a.conn = Conn::Up;
+        a.config = Some(ConfigPayload {
+            armed_at_boot: false,
+            sensors: vec!["usb".to_owned()],
+            dry_run: false,
+            power_action: PowerAction::PowerOff,
+            on_sensor_gap: OnSensorGap::Warn,
+            luks_destroy: Some(LuksDestroyInfo {
+                acknowledged: true,
+                target_header: "/dev/nvme0n1p3".to_owned(),
+                engaged: false,
+            }),
+            validation_error: None,
+        });
+        a
+    }
+
+    fn joined(lines: &[Line]) -> String {
+        lines.iter().map(|l| text(l)).collect::<Vec<_>>().join(" ")
+    }
+
     #[test]
-    fn state_line_hides_the_cached_engaged_value_while_the_daemon_is_down() {
+    fn body_is_pre_wrapped_so_logical_lines_equal_rendered_rows() {
+        let a = app_with_luks();
+        let lines = body_lines(&a);
+        // Well past `MIN_H` (18) minus chrome — the reason the screen scrolls.
+        assert!(lines.len() > 12, "got {} lines", lines.len());
+        assert_eq!(line_count(&a) as usize, lines.len());
+        // Every prose/state/hint row already fits the wrap width (+ the
+        // two-space indent), so `Paragraph` never re-wraps and the reducer's
+        // clamp against this logical count is accurate. (The `target header`
+        // line is a raw span and exempt — an exotic long path may still wrap.)
+        for l in &lines {
+            let s = text(l);
+            if s.contains("target header") {
+                continue;
+            }
+            assert!(s.len() <= BODY_WRAP + 2, "over-wide row: {s:?}");
+        }
+        // The engage hint is in the body, reachable by scrolling to the end.
+        assert!(
+            joined(&lines).contains("press Enter to ENGAGE"),
+            "got: {}",
+            joined(&lines)
+        );
+
+        // The "wipe is a stub" statement sits above the fold — an 18-row
+        // terminal has ~14 body rows, so the stub line must land well inside
+        // that (tui-ux S2, invariant 3).
+        let stub = lines
+            .iter()
+            .position(|l| text(l).contains("the wipe is a stub"))
+            .expect("stub line present");
+        assert!(
+            stub < 12,
+            "stub line at row {stub}, at/below the ~14-row fold"
+        );
+    }
+
+    #[test]
+    fn wrap_words_keeps_every_row_within_width_and_loses_no_text() {
+        let src = "the quick brown fox jumps over the lazy dog and then keeps on running";
+        let rows = wrap_words(src, 20);
+        assert!(rows.len() > 1);
+        for r in &rows {
+            assert!(r.len() <= 20, "over-wide row: {r:?}");
+        }
+        assert_eq!(rows.join(" "), src);
+    }
+
+    #[test]
+    fn state_lines_hide_the_cached_engaged_value_while_the_daemon_is_down() {
         let t = Theme::detect();
 
         // Even with a cached `engaged = false`, a downed daemon must not be
         // rendered as "not engaged" — that is the stale reading the review
         // gate flagged as sharpest on this screen.
-        let down = text(&state_line(&Conn::Down, false, &t));
+        let down = joined(&state_lines(&Conn::Down, false, &t));
         assert!(down.contains("UNKNOWN"), "got: {down}");
         assert!(!down.contains("not engaged"), "got: {down}");
 
         // Connected, the real state shows through both ways.
-        assert!(text(&state_line(&Conn::Up, true, &t)).contains("ENGAGED"));
-        assert!(text(&state_line(&Conn::Up, false, &t)).contains("not engaged"));
+        assert!(joined(&state_lines(&Conn::Up, true, &t)).contains("ENGAGED"));
+        assert!(joined(&state_lines(&Conn::Up, false, &t)).contains("not engaged"));
     }
 }

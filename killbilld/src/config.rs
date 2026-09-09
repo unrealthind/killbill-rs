@@ -499,7 +499,11 @@ mod tests {
         let raw = load(&path).expect("example config should load");
         let cfg = validate(raw).expect("example config should validate");
         assert!(cfg.dry_run, "the example ships in dry-run mode");
-        assert_eq!(cfg.whitelist.len(), 1);
+        assert_eq!(
+            cfg.whitelist.len(),
+            0,
+            "the example ships with no whitelisted devices — arming allows nothing until edited"
+        );
         assert!(cfg.luks_destroy.is_none(), "luks_destroy is commented out");
     }
 

@@ -83,6 +83,9 @@ fn run(terminal: &mut ratatui::DefaultTerminal, cli: &Cli) -> Result<()> {
                 ClientMsg::Event(ev) => app.on_event(ev),
             }
         }
+        // One fetch per dirtied data-kind for the whole drained batch, rather
+        // than a socket round-trip per event inside the loop above.
+        app.settle();
 
         app.expire_toast(Instant::now());
 

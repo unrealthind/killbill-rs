@@ -52,11 +52,11 @@
 
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{sync_channel, Sender, SyncSender};
+use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, Sender, SyncSender};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -103,6 +103,13 @@ pub enum ControlRequest {
         events: SyncSender<StreamEvent>,
         ack: SyncSender<SubscribeOutcome>,
     },
+    /// The subscription with this id has ended — its connection thread saw the
+    /// peer close (or is shutting down). The core drops the matching
+    /// `Subscriber` immediately, rather than waiting for the next broadcast to
+    /// notice the dead channel: on a quiet armed machine that broadcast may
+    /// never come, and a slowly-filling subscriber/connection cap is a slow
+    /// path to a daemon that cannot be disarmed (invariant 5).
+    Unsubscribe { id: u64 },
 }
 
 /// The core's answer to a [`ControlRequest::Subscribe`]. Never itself put on
@@ -110,10 +117,13 @@ pub enum ControlRequest {
 /// (`Reply::Ok` or `Reply::Error`); `backlog` (empty on refusal) is what it
 /// then replays as individual [`StreamEvent`] frames before switching to
 /// forwarding live ones from `events` (charter §8: the connection thread does
-/// the replay, never the core thread — see [`serve_subscription`]).
+/// the replay, never the core thread — see [`serve_subscription`]). `id`
+/// identifies the registered subscriber for a later [`ControlRequest::Unsubscribe`]
+/// (0 and meaningless on refusal).
 pub struct SubscribeOutcome {
     pub reply: Reply,
     pub backlog: Vec<StreamEvent>,
+    pub id: u64,
 }
 
 /// How long `serve` blocks in `accept` before re-checking the stop flag.
@@ -131,6 +141,14 @@ const SUBSCRIBER_QUEUE: usize = 256;
 /// A client that connects and then neither sends nor reads is disconnected
 /// after this long, rather than tying up a thread forever.
 const CONN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How often a subscription that is seeing no events checks whether its peer
+/// has quietly closed. The connection thread parks on the event channel, not
+/// the socket, so without this poll a departed client on a quiet machine keeps
+/// its `ConnSlot` and its core-side `Subscriber` until the next broadcast — see
+/// [`ControlRequest::Unsubscribe`]. Not a kill-path thread; a few seconds is
+/// ample and bounds the leak.
+const SUBSCRIPTION_POLL: Duration = Duration::from_secs(5);
 
 /// Decrements the live-connection count on drop, so a panicking connection
 /// thread cannot leak a slot. The control socket is the only way to disarm
@@ -240,13 +258,15 @@ pub fn remove_socket(path: &Path) {
 /// Bind the control socket at `path` (charter §8: `SOCK_SEQPACKET`, mode 0660,
 /// root-owned). Called on the daemon's main thread before the core loop starts:
 /// any failure here — another daemon already listening, a stale non-socket file,
-/// an unprobeable socket — is fatal, never a degraded run.
+/// an unprobeable socket, a writable parent directory — is fatal, never a
+/// degraded run.
 pub fn bind_listener(path: &Path) -> std::io::Result<UnixListener> {
     use nix::sys::socket::{
         bind, listen, socket, AddressFamily, Backlog, SockFlag, SockProtocol, SockType, UnixAddr,
     };
     use nix::sys::stat::{umask, Mode};
 
+    ensure_parent_dir_is_safe(path)?;
     ensure_path_is_free(path)?;
 
     let sock = socket(
@@ -281,6 +301,59 @@ pub fn bind_listener(path: &Path) -> std::io::Result<UnixListener> {
 
     listen(&sock, Backlog::MAXCONN).map_err(std::io::Error::from)?;
     Ok(UnixListener::from(sock))
+}
+
+/// Refuse to bind under a directory any non-root user can write to.
+///
+/// The socket's mode and ownership are set by *path* after `bind` (there is no
+/// `fchmod`/`fchown` on an unbound socket fd), so between `bind` and
+/// `set_permissions` a user who can create entries in the parent directory can
+/// unlink the fresh socket and drop a symlink in its place — turning the
+/// root-privileged `chmod 0660` / `chown root:root` into an arbitrary-target
+/// primitive. The default `/run` is root-only, so this only bites a
+/// non-standard `--socket`; it is still refused rather than trusted, and the
+/// man page promises exactly this check.
+///
+/// A directory is safe to hold a root control socket only if it — and every
+/// ancestor — is **root-owned** and **not group/other-writable**. The sticky
+/// bit does *not* exempt it: a non-root owner (or a non-root writer) of any
+/// component can unlink the fresh socket and drop a symlink between `bind` and
+/// the by-path `chmod`/`chown`, turning those into an arbitrary-target
+/// primitive. This matches `install.sh`'s definition of a safe `--prefix`.
+fn dir_perms_are_safe(uid: u32, mode: u32) -> bool {
+    uid == 0 && mode & 0o022 == 0
+}
+
+/// Refuse to bind unless every component of the socket's parent path is
+/// root-owned and not group/other-writable. The path is canonicalized first so
+/// a symlinked ancestor is inspected as its real target, not skipped.
+fn ensure_parent_dir_is_safe(path: &Path) -> std::io::Result<()> {
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
+    let parent = parent.unwrap_or_else(|| Path::new("."));
+
+    let parent = std::fs::canonicalize(parent)?;
+    if !std::fs::metadata(&parent)?.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} is not a directory", parent.display()),
+        ));
+    }
+
+    for dir in parent.ancestors() {
+        let meta = std::fs::metadata(dir)?;
+        if !dir_perms_are_safe(meta.uid(), meta.mode()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "{} is not root-owned or is group/other-writable — refusing to bind a \
+                     control socket under it (a symlink-swap window on the post-bind \
+                     chmod/chown). Use a root-only directory such as /run.",
+                    dir.display()
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Make sure nothing important is at `path`. A live daemon's socket → abort. A
@@ -487,26 +560,78 @@ fn serve_subscription(mut stream: UnixStream, peer: PeerCred, core: &Sender<Cont
     let outcome = ack_rx.recv().unwrap_or_else(|_| SubscribeOutcome {
         reply: Reply::Error("daemon dropped the subscription".to_owned()),
         backlog: Vec::new(),
+        id: 0,
     });
     let accepted = matches!(outcome.reply, Reply::Ok);
     if write_frame(&mut stream, &outcome.reply).is_err() || !accepted {
+        // Refused, or the ack write failed: the core registered nothing (a
+        // refusal) or is about to find its channel dead — nothing to unsubscribe.
         return;
     }
 
+    // The core now holds a `Subscriber` for `outcome.id`. Every path out of the
+    // forwarding loop below must tell it to drop that subscriber, or the slot
+    // leaks until the next broadcast happens to prune the dead channel.
+    forward_events(&mut stream, &outcome.backlog, &events_rx);
+    let _ = core.send(ControlRequest::Unsubscribe { id: outcome.id });
+}
+
+/// Replay the backlog, then forward live events until the peer goes away or the
+/// core drops its sender. Returns on either.
+fn forward_events(
+    stream: &mut UnixStream,
+    backlog: &[StreamEvent],
+    events_rx: &Receiver<StreamEvent>,
+) {
     // Replay the backlog as individual frames — never one batched frame (see
     // `Command::Subscribe`'s doc comment) — before switching to live events.
-    for stream_event in outcome.backlog {
-        if !write_event_frame(&mut stream, &stream_event) {
+    for stream_event in backlog {
+        if !write_event_frame(stream, stream_event) {
             return;
         }
     }
 
-    // Forward events until the client disconnects (a write fails or times out)
-    // or the core drops its sender (daemon shutdown / this subscriber pruned).
-    for event in events_rx {
-        if !write_event_frame(&mut stream, &event) {
-            break;
+    loop {
+        match events_rx.recv_timeout(SUBSCRIPTION_POLL) {
+            Ok(event) => {
+                if !write_event_frame(stream, &event) {
+                    return;
+                }
+            }
+            // No events for a while. The peer may have closed its end without us
+            // noticing — we park on the channel, not the socket. Check.
+            Err(RecvTimeoutError::Timeout) => {
+                if peer_has_closed(stream) {
+                    return;
+                }
+            }
+            // The core dropped its sender: daemon shutdown, or this subscriber
+            // was pruned as a slow reader.
+            Err(RecvTimeoutError::Disconnected) => return,
         }
+    }
+}
+
+/// Non-destructively check whether the subscription's peer has closed its end.
+/// A `recv` with `MSG_PEEK | MSG_DONTWAIT` returns `Ok(0)` once the peer has
+/// hung up, `EAGAIN` while it is still connected with nothing pending, and does
+/// not consume anything (a subscriber never sends anyway). `EINTR` (a signal
+/// handler ran on this thread) is also "still here". Any other error is treated
+/// as "gone" — a wedged socket is not worth keeping a slot for.
+fn peer_has_closed(stream: &UnixStream) -> bool {
+    use nix::sys::socket::{recv, MsgFlags};
+    let mut probe = [0u8; 1];
+    match recv(
+        stream.as_raw_fd(),
+        &mut probe,
+        MsgFlags::MSG_PEEK | MsgFlags::MSG_DONTWAIT,
+    ) {
+        Ok(0) => true,
+        Ok(_) => false,
+        // Still connected, nothing pending — or the probe was interrupted by a
+        // signal handler running on this thread. Neither means the peer is gone.
+        Err(nix::errno::Errno::EAGAIN | nix::errno::Errno::EINTR) => false,
+        Err(_) => true,
     }
 }
 
@@ -514,10 +639,10 @@ fn serve_subscription(mut stream: UnixStream, peer: PeerCred, core: &Sender<Cont
 /// connection itself is the problem (a real I/O failure — the client is gone,
 /// stop replaying) and `true` when a merely-oversized frame was skipped: an
 /// `encode` rejection (`ErrorKind::InvalidData`, capped in practice by
-/// `daemon::truncate_for_broadcast`, but defended here too) is this one
-/// event's problem, not the connection's, and must not silently end the
-/// subscription for every event after it — the daemon's own log always has
-/// the untruncated original.
+/// `killbill_proto::cap_report` at the daemon's broadcast sites, but defended
+/// here too) is this one event's problem, not the connection's, and must not
+/// silently end the subscription for every event after it — the daemon's own
+/// log always has the untruncated original.
 fn write_event_frame(stream: &mut UnixStream, event: &StreamEvent) -> bool {
     match write_frame(stream, event) {
         Ok(()) => true,
@@ -582,6 +707,36 @@ mod tests {
         bind(sock.as_raw_fd(), &UnixAddr::new(path).unwrap()).unwrap();
         listen(&sock, Backlog::MAXCONN).unwrap();
         UnixListener::from(sock)
+    }
+
+    #[test]
+    fn dir_perms_are_safe_wants_root_owned_and_not_group_or_other_writable() {
+        assert!(dir_perms_are_safe(0, 0o40755)); // root, drwxr-xr-x
+        assert!(dir_perms_are_safe(0, 0o40700)); // root, drwx------
+        assert!(!dir_perms_are_safe(1000, 0o40755)); // non-root owner
+        assert!(!dir_perms_are_safe(0, 0o40775)); // group-writable
+        assert!(!dir_perms_are_safe(0, 0o40757)); // other-writable
+        assert!(!dir_perms_are_safe(0, 0o41777)); // sticky does NOT exempt
+    }
+
+    #[test]
+    fn ensure_parent_dir_is_safe_accepts_a_system_directory() {
+        // `/run` (and `/`) are root-owned 0755 on any live system — this passes
+        // regardless of the uid running the test.
+        assert!(ensure_parent_dir_is_safe(Path::new("/run/killbilld.sock")).is_ok());
+    }
+
+    #[test]
+    fn ensure_parent_dir_is_safe_refuses_a_world_writable_ancestor() {
+        // `/tmp` is 01777 everywhere; the sticky bit is not an exemption.
+        let err = ensure_parent_dir_is_safe(Path::new("/tmp/killbilld.sock")).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn ensure_parent_dir_is_safe_propagates_a_missing_parent() {
+        let err = ensure_parent_dir_is_safe(Path::new("/nonexistent-kb-dir/x.sock")).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
     }
 
     #[test]
