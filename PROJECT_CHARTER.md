@@ -209,23 +209,27 @@ on_sensor_gap = "warn"      # warn | kill — what to do if the USB sensor drops
 
 ## 10. Packaging & installation
 
-**Artifacts:** three binaries (`killbilld`, `killbill-tui`, `killbillctl`), a `killbilld.service` systemd unit, a default config, man pages.
+**Artifacts (v0.1.0):** three binaries (`killbilld`, `killbill-tui`, `killbillctl`), a `killbilld.service` systemd unit + a `luks-destroy.conf.example` drop-in, `config.example.toml`, four man pages (`killbilld.8`, `killbillctl.1`, `killbill-tui.1`, `killbill.conf.5`), a static `x86_64` musl tarball with `SHA256SUMS` and `minisign` signatures on the GitHub release.
 
-**Build → package:**
-- `.deb` via `cargo-deb`
-- `.rpm` via `cargo-generate-rpm`
-- Arch via an AUR `PKGBUILD`
-- A plain install script as the universal fallback
+**Build → package** (all in `packaging/`):
+- `.deb` via `cargo-deb` (`[package.metadata.deb]` in `killbilld/Cargo.toml`)
+- `.rpm` via `cargo-generate-rpm` (`[package.metadata.generate-rpm]`)
+- Arch via an AUR `PKGBUILD` + `killbill-rs.install`
+- `install.sh` / `uninstall.sh` as the universal fallback (validates `--prefix` is root-owned and not user-writable — a root unit's `ExecStart` must never point into a writable tree)
 
-**`postinst` behavior:**
-- Create `/etc/killbill/` and install the default config **only if absent** (idempotent — fixes the original's broken first-run copy).
-- Create the log directory.
-- Enable the service but **do not auto-arm** until the user has configured a whitelist, so installation can never lock the user out.
+The maintainer-script contract lives once in `packaging/scripts/lib.sh` and is inlined verbatim into the `.deb`/`.rpm` scriptlets; `packaging/scripts/check-sync.sh` (CI) fails on drift. `packaging/scripts/check-release.sh` gates the release on a real `PKGBUILD` digest.
 
-**systemd unit hardening** (free hardening the Python version could not express):
-- `ProtectSystem`, `ProtectHome`, `NoNewPrivileges`
-- Minimal `CapabilityBoundingSet` — only what's needed to power off and open netlink, not full ambient root.
-- Optionally `landlock` (kernel 5.13+) later, gated so the daemon runs fine without it.
+**Install / upgrade behavior:**
+- Create `/etc/killbill/` and install the default config **only if absent** (idempotent — fixes the original's broken first-run copy). The shipped config has an **empty whitelist**: arming allows nothing until the operator edits it.
+- Enable the service but **never auto-arm** — installation can never lock the user out. The install verifies `systemctl start` succeeded and warns loudly (to stderr) if it did not.
+- An upgrade restarts the daemon; a restart always returns it **disarmed** (armed state is deliberately not persisted). The scripts warn before the restart if the running daemon is armed.
+
+**systemd unit hardening:**
+- `NoNewPrivileges`, `ProtectSystem=full` (not `=strict`: the control socket lives at `/run/killbilld.sock` and `=strict` would mount `/run` read-only — see §13.6), `ProtectHome`, `PrivateTmp`, `RestrictAddressFamilies=AF_UNIX AF_NETLINK`, `IPAddressDeny=any`, seccomp (`@system-service @reboot`, never `~@privileged`).
+- `CapabilityBoundingSet=CAP_SYS_BOOT` **only** — nothing else, and explicitly *not* `CAP_NET_ADMIN` (uevent receive needs no capability; holding it would allow forging uevents).
+- `KillSignal=SIGTERM` + `SendSIGKILL=no` + `TimeoutStopSec=infinity` so systemd never interrupts an in-progress poweroff (safe because `KILL_IN_FLIGHT` latches only on a real power action — see §13.5).
+- `ProtectKernelTunables=no` and **no** `ProcSubset=pid` — both would hide `/proc/sysrq-trigger`, the poweroff responder's last-resort fallback.
+- `landlock` (kernel 5.13+) is a future addition, gated so the daemon runs fine without it.
 
 ---
 
@@ -270,6 +274,9 @@ These were chosen during architecture but are reasonable to revisit. Document an
 2. **JSON vs. binary wire format.** JSON chosen for readability/debuggability; swappable later without changing the protocol shape.
 3. **Daemon-owns-config-writes.** Chosen to avoid file/running-state drift; the tradeoff is the daemon needs write logic a pure editor-TUI wouldn't. Considered settled unless a strong reason emerges.
 4. **`lock_screen_first`.** §9 introduced it as an "optional pre-poweroff nicety". Building it surfaced a conflict with principle 1 (the kill path is sacred): "lock *before* the power action" and "never delay the poweroff" cannot both hold — a real wait delays the kill, and a fire-and-forget lock loses the race against power being cut, so it would never actually lock. **v1 decision:** `validate` rejects `lock_screen_first = true` (fail closed, principle 2) rather than silently ignore it; `false`/absent is valid; the poweroff responder does not touch it. **If revisited:** the only kill-path-safe design is a *separate* fast responder that locks the screen the instant an unauthorized event is detected — concurrently with everything else, never awaited, independent of `power_action` — not a step sequenced before the poweroff. That is a new responder, not a poweroff-responder feature.
+5. **`KILL_IN_FLIGHT` latches on a *power action*, not on "irreversible".** The flag makes the process (and, under `SendSIGKILL=no`, the host's shutdown transaction) park forever — correct only because `reboot(2)` is not expected to return. A `power_action = "none"` kill with `luks_destroy` engaged is irreversible in intent but the responder *returns* (a stub in v1; a bounded operation when the wipe is real). **v1 decision:** the latch is gated strictly on `!dry_run && power != none`. When the LUKS wipe is implemented it gets its own *bounded* in-flight guard, separate from this latch — latching here on a response that returns would make the daemon unstoppable.
+6. **Control socket path & `ProtectSystem`.** The socket is `/run/killbilld.sock` (flat, in `/run`). This forces the unit to `ProtectSystem=full` rather than `=strict` (which mounts `/run` read-only). **v1 decision:** keep the flat path + `=full` — one line, no code churn, and `=full` still makes `/usr`/`/etc`/`/boot` read-only. A future move of the socket into a systemd `RuntimeDirectory` (`/run/killbilld/killbilld.sock`) would let the unit go to `=strict`; it needs the compiled defaults in all three binaries changed in lockstep.
+7. **systemd start-rate limit.** Left at the systemd default (5 starts / 10 s → `failed`). A persistently-failing sensor then lands in a visible `failed` state a monitor can see, rather than an endless restart loop; a dead sensor means no protection either way. Revisit if an operator wants unlimited restarts (`StartLimitIntervalSec=0`) instead.
 
 ---
 

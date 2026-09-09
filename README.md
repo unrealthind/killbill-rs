@@ -7,7 +7,7 @@
 [![Language: Rust](https://img.shields.io/badge/language-Rust_2021-orange.svg)](https://www.rust-lang.org/)
 [![Platform: Linux](https://img.shields.io/badge/platform-Linux_%2B_systemd-blue.svg)](#platform-support)
 [![License: GPL-3.0-or-later](https://img.shields.io/badge/license-GPL--3.0--or--later-green.svg)](#license)
-[![Status: Phase 2 (TUI)](https://img.shields.io/badge/status-Phase_2_%E2%80%94_TUI-yellow.svg)](#project-status)
+[![Release: v0.1.0](https://img.shields.io/badge/release-v0.1.0-green.svg)](#status)
 
 </div>
 
@@ -30,25 +30,38 @@ phones home.
 > all deliberately discarded. Every design decision is traceable to a concrete
 > defect in the original — see [Lessons from the original](#lessons-from-the-original).
 
+## Status
+
+**v0.1.0 — first public release**, for distribution and testing. The daemon,
+CLI, and TUI are feature-complete for v1; the netlink add/remove path, dry-run,
+`killbilld` under systemd, and a real poweroff on an unauthorized event are all
+verified on hardware. `luks_destroy` ships as a stub (see below). Report issues
+privately per [`SECURITY.md`](SECURITY.md).
+
 ---
 
 ## Table of contents
 
 - [Why a rewrite](#why-a-rewrite)
 - [How it works](#how-it-works)
+- [Install](#install)
+- [First run](#first-run)
 - [Architecture](#architecture)
 - [The non-negotiable invariants](#the-non-negotiable-invariants)
 - [Components](#components)
+- [`killbillctl`](#killbillctl)
+- [The TUI](#the-tui)
 - [Configuration](#configuration)
 - [The decision table](#the-decision-table)
 - [Control protocol](#control-protocol)
 - [LUKS header destruction (fenced, stub-only)](#luks-header-destruction-fenced-stub-only)
-- [Project status](#project-status)
+- [Security model](#security-model)
+- [Uninstall](#uninstall)
 - [Repository layout](#repository-layout)
 - [Building and testing](#building-and-testing)
 - [Platform support](#platform-support)
 - [Out of scope for v1](#out-of-scope-for-v1)
-- [Documentation](#documentation)
+- [Contributing](#contributing)
 - [License](#license)
 
 ---
@@ -89,7 +102,7 @@ every seam.
                                  ▼
                         ┌─────────────────┐
                         │ CONTROL SOCKET  │──► killbillctl (CLI)
-                        │ /run/killbilld  │──► killbill-tui (Phase 2)
+                        │ /run/killbilld  │──► killbill-tui           
                         │      .sock      │
                         └─────────────────┘
 ```
@@ -107,6 +120,85 @@ every seam.
 
 Reaction time is bounded by the kernel's own event delivery — milliseconds — and
 idle CPU is effectively zero.
+
+---
+
+## Install
+
+Every install path **enables the daemon but leaves it disarmed**, and installs
+the default config only if `/etc/killbill/config.toml` is absent. A fresh
+install can never lock you out.
+
+### From a package
+
+```bash
+# Debian / Ubuntu
+sudo apt install ./killbill-rs_0.1.0_amd64.deb
+
+# Fedora / RHEL
+sudo dnf install ./killbill-rs-0.1.0-1.x86_64.rpm
+
+# Arch (AUR)
+git clone https://aur.archlinux.org/killbill-rs.git && cd killbill-rs && makepkg -si
+```
+
+### From the release tarball
+
+```bash
+tar xzf killbill-rs-0.1.0-x86_64-linux-musl.tar.gz
+sudo ./install.sh                      # or: sudo ./install.sh --prefix /opt/killbill
+```
+
+### From source
+
+```bash
+cargo build --release --workspace
+sudo packaging/install.sh --from-build
+```
+
+### Verifying downloads
+
+Release artifacts are signed with [minisign](https://jedisct1.github.io/minisign/).
+The public key is published in the GitHub release notes and at
+`https://github.com/unrealthind/killbill-rs`.
+
+```bash
+minisign -Vm SHA256SUMS -P <published-public-key>
+sha256sum -c SHA256SUMS
+```
+
+> [!NOTE]
+> A package **upgrade** restarts the daemon, and a restart always comes back
+> **disarmed** (armed state is deliberately never persisted). The maintainer
+> scripts warn when this happens — run `sudo killbillctl arm` again afterward.
+
+---
+
+## First run
+
+```bash
+# 1. See the daemon (enabled, disarmed, empty whitelist)
+killbillctl status
+
+# 2. Whitelist the devices you keep plugged in — vendor:product in lowercase hex
+lsusb
+sudo killbillctl whitelist add 1050:0407 --label "YubiKey 5C" --max-count 1
+#    ...or plug the device in and press Enter on it in `killbill-tui`.
+
+# 3. Check what a kill decision would look like right now — touches nothing
+killbillctl test
+
+# 4. Arm in dry-run first: decisions are logged, no poweroff
+sudo killbillctl config set dry-run on
+sudo killbillctl arm
+#    unplug something, watch `journalctl -u killbilld -f` and `killbillctl events`
+
+# 5. Go live
+sudo killbillctl config set dry-run off
+sudo killbillctl arm
+```
+
+Disarm is always `sudo killbillctl disarm` — never a signal.
 
 ---
 
@@ -160,19 +252,60 @@ These are design guarantees, not preferences.
 |---|---|---|
 | **`killbilld`** | The daemon. Owns config and armed-state, runs sensors, evaluates policy, dispatches responders, serves the control socket. | root, under systemd |
 | **`killbillctl`** | The CLI client. Scriptable, headless-friendly. Everything the TUI can do. | any user with socket access |
-| **`killbill-tui`** | *(Phase 2)* A ratatui client — live device list, plug-and-whitelist, armed toggle, dry-run, the fenced destruction screen. A **separate binary** so a UI crash can never touch protection. | any user with socket access |
+| **`killbill-tui`** | A ratatui client — live device list, plug-and-whitelist, armed toggle, dry-run, event log, config inspector, and the fenced destruction screen. A **separate binary** so a UI crash can never touch protection. | any user with socket access |
 
-### `killbillctl` commands
+---
 
-```
-killbillctl status                     # armed? sensor healthy? config? whitelist?
-killbillctl devices                    # what the daemon is currently tracking
-killbillctl arm | disarm               # disarm is a logged socket command
-killbillctl test                       # dry-run: report what would happen, touch nothing
-killbillctl whitelist add|remove|list
-killbillctl reload                     # re-read and re-validate the config file
-killbillctl events                     # stream the daemon's event feed
-```
+## `killbillctl`
+
+Everything the daemon can do, headless. Read-only commands work as any user with
+socket access; state changes require root.
+
+| Command | What it does |
+|---|---|
+| `killbillctl status` | armed? sensor healthy? config valid? whitelist / device counts |
+| `killbillctl devices` | devices the daemon is currently tracking |
+| `sudo killbillctl arm` / `disarm` | flip protection — both logged with the calling peer; disarm is socket-only, never a signal |
+| `killbillctl test` | dry-run over the connected devices: report what would fire, touch nothing |
+| `killbillctl whitelist list` | the active whitelist, connected/absent marked |
+| `sudo killbillctl whitelist add 1050:0407 --label "YubiKey 5C" --max-count 1` | allow a device while armed |
+| `sudo killbillctl whitelist remove 1050:0407` | remove an entry |
+| `killbillctl config show` | the running config |
+| `sudo killbillctl config set dry-run on\|off` | toggle dry-run (immediate) |
+| `sudo killbillctl config set power-action poweroff\|halt\|none` | change the power action (immediate) |
+| `sudo killbillctl config set armed-at-boot on\|off` | arm automatically at daemon start |
+| `sudo killbillctl config set on-sensor-gap warn\|kill` | what to do if the sensor loses events |
+| `sudo killbillctl config set sensors usb` | sensor set — **applied at daemon start**, restart required |
+| `sudo killbillctl luks engage on\|off` | flip the runtime LUKS-destroy toggle (v1: records intent, wipes nothing) |
+| `sudo killbillctl reload` | re-read and re-validate the config file; a bad file is rejected, the running config kept |
+| `killbillctl events [--follow]` | the daemon's event stream; without `--follow`, drains the backlog and exits |
+
+---
+
+## The TUI
+
+`killbill-tui` is a full-screen client. It never changes the daemon's armed
+state on its own, and **killing it — even `kill -9` — leaves the daemon exactly
+as armed as it was**.
+
+| Key | Action |
+|---|---|
+| `↑` / `↓` (`k` / `j`) | move the selection, or scroll |
+| `Enter` | activate the selection / confirm a modal |
+| `Esc` | close a modal, else back to Devices |
+| `m` | main menu (Devices · Whitelist · Dry-run · Settings · Event log · Config · LUKS destroy · Arm · Disarm · Reload · Help · Quit) |
+| `?` | help screen |
+| `r` | refresh, or retry while the daemon is unreachable |
+| `p` | on the event log: freeze / resume following |
+| `q` or `Ctrl-C` | quit (never disarms) |
+
+Arm, Disarm, Reload, and any settings change that *lowers* protection while
+armed each go through a confirm step. The LUKS-destroy screen is visually
+distinct, names the exact target device, and requires typing `DESTROY` then `y`
+— any other key cancels.
+
+The armed state is shown by a **glyph and a word**, not colour alone, so it
+survives `NO_COLOR` and a monochrome terminal.
 
 ---
 
@@ -261,8 +394,7 @@ Because LUKS is assumed to already exist, the correct "destroy data" primitive
 is not per-file shredding but wiping the **LUKS header / keyslot**, which makes
 the whole disk unrecoverable in milliseconds and is reliable on flash storage.
 
-In **v1 this is a stub.** The config schema, validation, dry-run message, and
-(Phase 2) the TUI screen are all real and correct. The header wipe itself is
+In **v1 this is a stub.** The config schema, validation, dry-run message, and the TUI screen are all real and correct. The header wipe itself is
 **deliberately not implemented** — there is no live footgun during development.
 
 Enabling it requires, all at once:
@@ -271,62 +403,47 @@ Enabling it requires, all at once:
 - The spelled-out acknowledgment key `i_understand_this_is_irreversible = true`
   — never a generic `enabled`.
 - A `target_header` that resolves to a real block device under `/dev/`.
-- *(Phase 2)* A visually-distinct TUI screen that names the exact target device
-  and requires typing `DESTROY`.
+- A visually-distinct TUI screen that names the exact target device and
+  requires typing `DESTROY`, then `y`.
 
 Dry-run always logs `would destroy LUKS header on /dev/…` and touches nothing.
 
 ---
 
-## Project status
+## Security model
 
-Three phases, strictly ordered — the backend has to be trustworthy before
-anything renders it, and it ships only once it is proven on real hardware.
+The full statement is [`SECURITY.md`](SECURITY.md). In short:
 
-### Phase 1 — Backend  ·  ✅ **done, hardware-verified 2026-09-08**
+- **Threat model** — physical seizure or tampering of one person's own,
+  LUKS-encrypted laptop. Not a remote-attacker or fleet tool.
+- **Privilege** — the daemon runs as root with exactly one capability,
+  `CAP_SYS_BOOT` (for `reboot(2)`). It explicitly does **not** hold
+  `CAP_NET_ADMIN` — receiving kernel uevents needs no capability, and holding it
+  would let anything sharing the daemon's user forge them. The systemd unit adds
+  `NoNewPrivileges`, `ProtectSystem=full`, `ProtectHome`, seccomp, and
+  `RestrictAddressFamilies=AF_UNIX AF_NETLINK`.
+- **The socket** — `0660 root:root`; "who may talk to the daemon" is a
+  filesystem question. The daemon refuses to start if the socket's parent
+  directory is writable by non-root.
+- **Fail closed** — an invalid config disables protection *loudly*: the daemon
+  runs but refuses to arm until the config is fixed and reloaded.
+- **The kill path is never blocked** — logging, config I/O, and connected UIs
+  are all off it. Once a kill decision is made, nothing delays the poweroff.
+- **No network, no telemetry** — ever. The only IPC is the local Unix socket.
+- **`luks_destroy` is a stub in v1** — "it didn't wipe the header" is not a
+  vulnerability.
 
-| Step | Item | State |
-|---|---|---|
-| 1 | Cargo workspace + `killbill-proto` shared types | ✅ implemented |
-| 2 | Config: TOML load + fail-closed validation | ✅ implemented |
-| 3 | Policy engine (`decide`) + decision table | ✅ implemented |
-| 4 | Responders: `Responder` trait, `logger`, `poweroff`, `luks-destroy` stub | ✅ implemented |
-| 5 | USB sensor: `Sensor` trait + netlink uevent implementation | ✅ implemented |
-| 6 | Control server: `SOCK_SEQPACKET`, framed JSON, event fan-out | ✅ implemented |
-| 7 | `killbillctl`: all commands | ✅ implemented |
+---
 
-> All seven steps are code-complete, reviewed, and green on
-> `cargo test --workspace` / `clippy -D warnings`. **All exit criteria are now
-> verified on real hardware:** a real netlink add/remove run, dry-run, a
-> `killbilld` run under systemd, and a real poweroff on an unauthorized event
-> all confirmed on 2026-09-08. See [`CLAUDE.md`](CLAUDE.md) for the full
-> results and the one packaging-relevant finding (an SELinux label gotcha for
-> Phase 3). Phase 2 (`killbill-tui`) is now the active phase.
+## Uninstall
 
-**Exit criteria:** `killbilld` runs under systemd; plug/unplug produces correct
-decisions; dry-run reports and touches nothing; `killbillctl` drives every
-command; an invalid config refuses to arm; poweroff fires for real on an
-unauthorized event.
+```bash
+sudo apt remove killbill-rs          # or: dnf remove / pacman -Rns
+sudo ./uninstall.sh                  # for an install.sh install (reads its manifest)
+```
 
-### Phase 2 — TUI  ·  *current*
-
-`killbill-tui` on ratatui, a separate binary and a pure client of the Phase 1
-protocol. Screens: live device list, plug-and-whitelist, armed toggle, dry-run
-results, and the fenced destruction screen.
-
-**Exit criteria:** a device can be whitelisted end-to-end by plugging it in and
-pressing a key; killing the TUI mid-session leaves the daemon armed and healthy.
-
-### Phase 3 — Ship
-
-`killbilld.service` with `ProtectSystem`, `ProtectHome`, `NoNewPrivileges`, and
-a minimal `CapabilityBoundingSet`. Packaging: `.deb` (cargo-deb), `.rpm`
-(cargo-generate-rpm), AUR `PKGBUILD`, plain install script, man pages.
-`postinst` is idempotent: install the default config only if absent, enable the
-service but **never auto-arm**.
-
-**Exit criteria:** install from a package on a clean machine, configure a
-whitelist, arm, and have it work — with no manual repair steps.
+Removal stops and disables the daemon and leaves `/etc/killbill/` in place. A
+`.deb` **purge** (`apt purge`) also removes the config directory.
 
 ---
 
@@ -334,11 +451,12 @@ whitelist, arm, and have it work — with no manual repair steps.
 
 ```
 killbill-rs/
-├── Cargo.toml                  workspace: killbill-proto, killbilld, killbillctl
+├── Cargo.toml                  workspace: killbill-proto, killbilld, killbillctl, killbill-tui
 ├── rust-toolchain.toml         pinned: stable + rustfmt + clippy
 ├── config.example.toml         fully-commented reference config (mirrors charter §9)
 ├── PROJECT_CHARTER.md          source of truth for WHAT and WHY
-├── CLAUDE.md                   source of truth for HOW we build
+├── CONTRIBUTING.md · SECURITY.md · CHANGELOG.md · docs/DESIGN-NOTES.md
+├── packaging/                  systemd unit, .deb/.rpm/AUR metadata, install.sh, man pages
 │
 ├── killbill-proto/             the shared wire vocabulary — #![forbid(unsafe_code)]
 │   └── src/
@@ -369,8 +487,12 @@ killbill-rs/
 ├── killbillctl/                the CLI client — #![forbid(unsafe_code)]
 │   └── src/main.rs
 │
-└── killbill-tui/               the ratatui client (Phase 2, in progress)
+└── killbill-tui/               the ratatui client — #![forbid(unsafe_code)]
     └── src/
+        ├── app.rs              the reducer: a cache of daemon state + the modal state machine
+        ├── client.rs           the transport (fresh connection per command) + a Client trait
+        ├── input.rs            keys → intents
+        └── ui/                 one module per screen + the persistent status band
 ```
 
 The daemon's logic lives in `lib.rs` so it is testable without spawning a
@@ -466,15 +588,20 @@ prevents it in v1. Charter §12 is the authority.
 
 ---
 
-## Documentation
+## Contributing
+
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) — building and testing (rejection cases
+carry the weight), the non-negotiable invariants, the three-seam architecture,
+and how to propose a sensor or responder without touching the core.
 
 | Document | Purpose |
 |---|---|
-| [`PROJECT_CHARTER.md`](PROJECT_CHARTER.md) | The single source of truth for **what** v1 is, what it is not, and **why**. |
-| [`CLAUDE.md`](CLAUDE.md) | The source of truth for **how** the codebase is built — invariants, phases, conventions, review process. |
+| [`PROJECT_CHARTER.md`](PROJECT_CHARTER.md) | Source of truth for **what** v1 is, what it is not, and **why**. |
+| [`CONTRIBUTING.md`](CONTRIBUTING.md) | How to build, test, and extend the codebase. |
+| [`docs/DESIGN-NOTES.md`](docs/DESIGN-NOTES.md) | Deeper rationale for the non-obvious decisions. |
+| [`SECURITY.md`](SECURITY.md) | Threat model, scope, and private reporting. |
+| [`CHANGELOG.md`](CHANGELOG.md) | What ships in each release. |
 | [`config.example.toml`](config.example.toml) | A fully-commented reference configuration. |
-
-If the charter and `CLAUDE.md` ever disagree, the charter wins.
 
 ---
 
