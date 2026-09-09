@@ -108,7 +108,8 @@ done
 echo "install.sh: prefix $PREFIX, unit $UNIT"
 
 # --- binaries --------------------------------------------------------------
-: > "$MANIFEST.tmp" 2>/dev/null || { install -d -m 0755 "$(dirname "$MANIFEST")"; : > "$MANIFEST.tmp"; }
+install -d -m 0755 "$(dirname -- "$MANIFEST")"
+: > "$MANIFEST.tmp"
 record() { echo "$1" >> "$MANIFEST.tmp"; }
 
 for b in killbilld killbillctl killbill-tui; do
