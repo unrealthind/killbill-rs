@@ -167,6 +167,12 @@ fn invoke(power: PowerAction) {
     let sysrq = std::fs::write("/proc/sysrq-trigger", b"o");
     let Err(halt_errno) = reboot(RebootMode::RB_HALT_SYSTEM);
 
+    // Every path failed and the machine is still up. Record it so the daemon's
+    // park-forever shutdown lets the process exit for a supervisor restart
+    // instead of becoming a signal-immune zombie (set before logging — a wedged
+    // sink must not gate this).
+    super::mark_kill_failed();
+
     tracing::error!(
         %reboot_errno,
         sysrq = ?sysrq,
@@ -181,6 +187,7 @@ fn invoke(power: PowerAction) {
 /// the daemon binary links and the pure code is testable anywhere.
 #[cfg(not(target_os = "linux"))]
 fn invoke(power: PowerAction) {
+    super::mark_kill_failed();
     tracing::error!(
         ?power,
         "poweroff is unimplemented on this platform; NO power action taken"

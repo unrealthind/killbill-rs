@@ -19,12 +19,18 @@ serde = { workspace = true }
 thiserror = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }
+anyhow = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-appender = { workspace = true }
 
-# The poweroff responder calls reboot(2) directly on Linux (invariant 6: no
-# shelling out). Every other target gets a stub, so the crate still builds and
-# unit-tests anywhere.
-[target.'cfg(target_os = "linux")'.dependencies]
+# Syscalls (netlink uevent socket, poweroff, the AF_UNIX control socket) all go
+# through `nix`'s safe wrappers, so `#![deny(unsafe_code)]` holds crate-wide with
+# no local exception. Unix-only; the netlink/poweroff bits are further
+# `#[cfg(target_os = "linux")]`-gated in the source with non-Linux stubs, and
+# the `control`/`daemon` modules are `#[cfg(unix)]`.
+[target.'cfg(unix)'.dependencies]
 nix = { workspace = true }
+signal-hook = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

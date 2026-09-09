@@ -13,11 +13,11 @@
 //! the operator's only account of what happened). Dry run and real run behave
 //! identically here — that is the point of the stub.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use killbill_proto::Action;
 
-use super::Responder;
+use super::{Responder, ResponderNotReady};
 
 /// The one line this responder emits for a LUKS-destroy "response". Static text
 /// only; the target travels as a separate field.
@@ -57,6 +57,44 @@ impl Responder for LuksDestroyResponder {
             "{STUB_MESSAGE}"
         );
     }
+
+    fn preflight(&self) -> Result<(), ResponderNotReady> {
+        preflight_target(&self.target).map_err(|reason| ResponderNotReady {
+            responder: self.name(),
+            reason,
+        })
+    }
+}
+
+/// Arm-time check (invariant 2, charter §5): the configured target must exist
+/// and be a block device. This is **not** a real LUKS-header probe — that lands
+/// in Phase 3 with the actual wipe — but it is the fail-closed gate that
+/// `config.rs` and the charter promise, so a typo'd or unplugged target refuses
+/// the arm rather than surfacing at kill time.
+#[cfg(unix)]
+fn preflight_target(target: &Path) -> Result<(), String> {
+    use std::os::unix::fs::FileTypeExt;
+
+    let meta = std::fs::metadata(target).map_err(|e| {
+        format!(
+            "luks_destroy target {} cannot be read: {e}",
+            target.display()
+        )
+    })?;
+    if !meta.file_type().is_block_device() {
+        return Err(format!(
+            "luks_destroy target {} is not a block device",
+            target.display()
+        ));
+    }
+    // TODO(phase 3): read the LUKS2 magic from the header and refuse to arm if
+    // the target is not actually a LUKS container.
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn preflight_target(_target: &Path) -> Result<(), String> {
+    Err("luks_destroy is only supported on Unix".to_owned())
 }
 
 #[cfg(test)]
@@ -98,5 +136,22 @@ mod tests {
         let r = LuksDestroyResponder::new(PathBuf::from("/dev/sda2"));
         r.respond(&action(true, true));
         r.respond(&action(true, false));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn preflight_refuses_a_target_that_is_not_a_block_device() {
+        // A path that does not exist.
+        let missing = LuksDestroyResponder::new(PathBuf::from("/dev/killbill-does-not-exist"));
+        assert!(missing.preflight().is_err());
+
+        // A regular file is not a block device.
+        let dir = std::env::temp_dir().join(format!("killbilld-luks-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let regular = dir.join("not-a-device");
+        std::fs::write(&regular, b"x").unwrap();
+        let r = LuksDestroyResponder::new(regular);
+        assert!(r.preflight().is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

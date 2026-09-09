@@ -6,8 +6,8 @@
 
 [![Language: Rust](https://img.shields.io/badge/language-Rust_2021-orange.svg)](https://www.rust-lang.org/)
 [![Platform: Linux](https://img.shields.io/badge/platform-Linux_%2B_systemd-blue.svg)](#platform-support)
-[![License: GPL-2.0-or-later](https://img.shields.io/badge/license-GPL--2.0--or--later-green.svg)](#license)
-[![Status: Phase 1 (backend)](https://img.shields.io/badge/status-Phase_1_%E2%80%94_backend-yellow.svg)](#project-status)
+[![License: GPL-3.0-or-later](https://img.shields.io/badge/license-GPL--3.0--or--later-green.svg)](#license)
+[![Status: Phase 2 (TUI)](https://img.shields.io/badge/status-Phase_2_%E2%80%94_TUI-yellow.svg)](#project-status)
 
 </div>
 
@@ -165,11 +165,13 @@ These are design guarantees, not preferences.
 ### `killbillctl` commands
 
 ```
-killbillctl status                     # armed? sensors? whitelist?
+killbillctl status                     # armed? sensor healthy? config? whitelist?
+killbillctl devices                    # what the daemon is currently tracking
 killbillctl arm | disarm               # disarm is a logged socket command
 killbillctl test                       # dry-run: report what would happen, touch nothing
 killbillctl whitelist add|remove|list
 killbillctl reload                     # re-read and re-validate the config file
+killbillctl events                     # stream the daemon's event feed
 ```
 
 ---
@@ -240,9 +242,12 @@ root-owned**. "Who may talk to the daemon" is a filesystem question.
 
 | Traffic | Messages |
 |---|---|
-| **Commands** (client → daemon, expects a reply) | `GetStatus`, `ListDevices`, `Arm`, `Disarm`, `WhitelistAdd`, `WhitelistRemove`, `RunDryRun`, `ReloadConfig` |
-| **Replies** (daemon → client) | success/failure + payload |
-| **Events** (daemon → subscribers, unsolicited) | `DeviceAdded`, `DeviceRemoved`, `Armed`, `Disarmed`, `WouldKill(reason)` |
+| **Commands** (client → daemon, expects a reply) | `GetStatus`, `ListDevices`, `Arm`, `Disarm`, `WhitelistAdd`, `WhitelistRemove`, `WhitelistList`, `RunDryRun`, `ReloadConfig`, `Subscribe` |
+| **Replies** (daemon → client) | `Ok`, `Status`, `Devices`, `Whitelist`, `DryRun`, `Error` |
+| **Events** (daemon → subscribers, unsolicited) | `DeviceAdded`, `DeviceRemoved`, `Armed`, `Disarmed`, `WouldKill(reason)`, `SensorStopped`, `EventsLost` |
+
+Everything except the three read-only queries requires `uid 0` on the connecting
+peer (`SO_PEERCRED`) — including `Subscribe`, whose stream carries device ids.
 
 **Framing:** length-prefixed frames. **Serialization:** serde + JSON for v1 —
 readable and debuggable, swappable to a binary codec later without changing the
@@ -278,26 +283,32 @@ Dry-run always logs `would destroy LUKS header on /dev/…` and touches nothing.
 Three phases, strictly ordered — the backend has to be trustworthy before
 anything renders it, and it ships only once it is proven on real hardware.
 
-### Phase 1 — Backend  ·  *in progress*
+### Phase 1 — Backend  ·  ✅ **done, hardware-verified 2026-09-08**
 
 | Step | Item | State |
 |---|---|---|
 | 1 | Cargo workspace + `killbill-proto` shared types | ✅ implemented |
 | 2 | Config: TOML load + fail-closed validation | ✅ implemented |
 | 3 | Policy engine (`decide`) + decision table | ✅ implemented |
-| 4 | Responders: `Responder` trait, `logger`, `poweroff`, `luks-destroy` stub | ⏳ not started |
-| 5 | USB sensor: `Sensor` trait + netlink uevent implementation | ⏳ not started |
-| 6 | Control server: `SOCK_SEQPACKET`, framed JSON, event fan-out | ⏳ not started |
-| 7 | `killbillctl`: all commands | ⏳ not started |
+| 4 | Responders: `Responder` trait, `logger`, `poweroff`, `luks-destroy` stub | ✅ implemented |
+| 5 | USB sensor: `Sensor` trait + netlink uevent implementation | ✅ implemented |
+| 6 | Control server: `SOCK_SEQPACKET`, framed JSON, event fan-out | ✅ implemented |
+| 7 | `killbillctl`: all commands | ✅ implemented |
 
-> Steps 1–3 are pending the maintainer's build/test run and a review-agent pass.
+> All seven steps are code-complete, reviewed, and green on
+> `cargo test --workspace` / `clippy -D warnings`. **All exit criteria are now
+> verified on real hardware:** a real netlink add/remove run, dry-run, a
+> `killbilld` run under systemd, and a real poweroff on an unauthorized event
+> all confirmed on 2026-09-08. See [`CLAUDE.md`](CLAUDE.md) for the full
+> results and the one packaging-relevant finding (an SELinux label gotcha for
+> Phase 3). Phase 2 (`killbill-tui`) is now the active phase.
 
 **Exit criteria:** `killbilld` runs under systemd; plug/unplug produces correct
 decisions; dry-run reports and touches nothing; `killbillctl` drives every
 command; an invalid config refuses to arm; poweroff fires for real on an
 unauthorized event.
 
-### Phase 2 — TUI
+### Phase 2 — TUI  ·  *current*
 
 `killbill-tui` on ratatui, a separate binary and a pure client of the Phase 1
 protocol. Screens: live device list, plug-and-whitelist, armed toggle, dry-run
@@ -335,15 +346,31 @@ killbill-rs/
 │       ├── action.rs           Action, KillReason, PowerAction
 │       └── protocol.rs         Command / Reply / Event + framed JSON codec
 │
-├── killbilld/                  the daemon — logic in lib.rs, thin main.rs
+├── killbilld/                  the daemon — logic in lib.rs, thin main.rs, #![deny(unsafe_code)]
 │   └── src/
+│       ├── lib.rs              re-exports; what the tests target
 │       ├── config.rs           TOML load + fail-closed validate (collects every error)
+│       ├── config_store.rs     atomic config write-back (the daemon owns config writes)
 │       ├── policy.rs           the pure `decide` fn + decision table
 │       ├── device_table.rs     what is currently connected
-│       └── main.rs             placeholder stub (step 4+)
+│       ├── daemon.rs           run(): the one authority thread wiring it all together
+│       ├── control.rs          SOCK_SEQPACKET control server, SO_PEERCRED authz
+│       ├── sensor/             Seam 1 — the Sensor trait and the USB implementation
+│       │   ├── mod.rs          Sensor trait, spawn/SensorHandle, StopFlag
+│       │   ├── netlink.rs      NETLINK_KOBJECT_UEVENT socket loop (Linux-gated)
+│       │   └── uevent.rs       the pure byte parser — tested against captured payloads
+│       ├── responder/          independent subscribers to an Action (invariant 1)
+│       │   ├── mod.rs          Responder trait, dispatch fan-out, preflight, kill_in_flight
+│       │   ├── logger.rs       structured tracing record of each decision
+│       │   ├── poweroff.rs     reboot(2) via nix + SysRq/halt fallbacks; arm-time CAP_SYS_BOOT check
+│       │   └── luks_destroy.rs LUKS-header-wipe — logging stub only (invariant 3)
+│       └── main.rs             thin shell: flags, log sink, hand off to daemon::run
 │
-└── killbillctl/                the CLI client — placeholder stub (step 7)
-    └── src/main.rs
+├── killbillctl/                the CLI client — #![forbid(unsafe_code)]
+│   └── src/main.rs
+│
+└── killbill-tui/               the ratatui client (Phase 2, in progress)
+    └── src/
 ```
 
 The daemon's logic lives in `lib.rs` so it is testable without spawning a
@@ -365,8 +392,8 @@ cargo build --workspace
 # with rejection cases tested as hard as the accept cases
 cargo test --workspace
 
-# Lint and format
-cargo clippy --workspace --all-targets
+# Lint and format — clippy is warning-clean and CI-gated with -D warnings
+cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 ```
 
@@ -375,13 +402,16 @@ not live hardware.
 
 ### Conventions
 
-- **Rust 2021+, stable toolchain.** Tokio is the recommended async runtime.
+- **Rust 2021+, stable toolchain.** No async runtime — `std::thread` +
+  `std::sync::mpsc` throughout (charter §13.1); the kill path must not depend on
+  an executor.
 - **No `unwrap()` / `expect()` in daemon runtime paths.** Startup and tests are fine.
 - **Errors:** `thiserror` for library error types, `anyhow` at binary boundaries.
 - **Logging:** `tracing`. The *decision* — what fired and why — is logged as
   carefully as the event. The log is the operator's only account of what happened.
-- **`unsafe` needs a comment** stating the invariant it upholds. Expect it only
-  around netlink socket setup and the poweroff syscall.
+- **`unsafe` needs a comment** stating the invariant it upholds. `killbilld` is
+  `#![deny(unsafe_code)]` today (the poweroff syscall goes through `nix`); expect
+  a local `#[allow]` only if netlink socket setup in step 5 needs one.
 
 This is deliberately a **teachable codebase**: where clarity and maximum
 hardening conflict, clarity wins — the one exception being the kill path, which
@@ -450,4 +480,5 @@ If the charter and `CLAUDE.md` ever disagree, the charter wins.
 
 ## License
 
-GPL-2.0-or-later. See the `license` field in [`Cargo.toml`](Cargo.toml).
+GPL-3.0-or-later. See [`LICENSE`](LICENSE) and the `license` field in
+[`Cargo.toml`](Cargo.toml).

@@ -44,20 +44,35 @@ pub enum Decision {
 /// `table` must be the device table as it was **before** `event` is applied —
 /// the daemon calls `decide` first, then updates the table. This is why
 /// [`KillReason::CountExceeded`]'s `seen` is `table.count(id) + 1`.
-pub fn decide(event: &SensorEvent, cfg: &Config, table: &DeviceTable) -> Decision {
+///
+/// `luks_destroy_engaged` is the runtime toggle from
+/// [`killbill_proto::Command::SetLuksDestroyEngaged`] (`Core` state, not
+/// config) — see [`act`] for why it takes two flags, not one, to set
+/// `Action::luks_destroy`.
+pub fn decide(
+    event: &SensorEvent,
+    cfg: &Config,
+    table: &DeviceTable,
+    luks_destroy_engaged: bool,
+) -> Decision {
     match event.kind {
-        EventKind::Added => decide_added(event, cfg, table),
-        EventKind::Removed => decide_removed(event, cfg),
+        EventKind::Added => decide_added(event, cfg, table, luks_destroy_engaged),
+        EventKind::Removed => decide_removed(event, cfg, luks_destroy_engaged),
     }
 }
 
-fn decide_added(event: &SensorEvent, cfg: &Config, table: &DeviceTable) -> Decision {
+fn decide_added(
+    event: &SensorEvent,
+    cfg: &Config,
+    table: &DeviceTable,
+    luks_destroy_engaged: bool,
+) -> Decision {
     let Some(id) = event.identity.usb_id else {
-        return act(cfg, KillReason::UnidentifiedDevice);
+        return act(cfg, KillReason::UnidentifiedDevice, luks_destroy_engaged);
     };
 
     match cfg.whitelist.iter().find(|rule| rule.id == id) {
-        None => act(cfg, KillReason::UnknownDevice { id }),
+        None => act(cfg, KillReason::UnknownDevice { id }, luks_destroy_engaged),
         Some(rule) => {
             let seen = table.count(id).saturating_add(1);
             if seen > rule.max_count {
@@ -68,6 +83,7 @@ fn decide_added(event: &SensorEvent, cfg: &Config, table: &DeviceTable) -> Decis
                         max: rule.max_count,
                         seen,
                     },
+                    luks_destroy_engaged,
                 )
             } else {
                 Decision::Ignore
@@ -76,21 +92,32 @@ fn decide_added(event: &SensorEvent, cfg: &Config, table: &DeviceTable) -> Decis
     }
 }
 
-fn decide_removed(event: &SensorEvent, cfg: &Config) -> Decision {
+fn decide_removed(event: &SensorEvent, cfg: &Config, luks_destroy_engaged: bool) -> Decision {
     match event.identity.usb_id {
-        Some(id) if cfg.whitelist.iter().any(|rule| rule.id == id) => {
-            act(cfg, KillReason::WhitelistedDeviceRemoved { id })
-        }
-        id => act(cfg, KillReason::DeviceRemoved { id }),
+        Some(id) if cfg.whitelist.iter().any(|rule| rule.id == id) => act(
+            cfg,
+            KillReason::WhitelistedDeviceRemoved { id },
+            luks_destroy_engaged,
+        ),
+        id => act(cfg, KillReason::DeviceRemoved { id }, luks_destroy_engaged),
     }
 }
 
 /// Build an `Act` decision, stamping it with the config's response settings.
-fn act(cfg: &Config, reason: KillReason) -> Decision {
+///
+/// `Action::luks_destroy` requires **both** flags: `cfg.luks_destroy.is_some()`
+/// (the config-time acknowledgment, `i_understand_this_is_irreversible`) *and*
+/// `luks_destroy_engaged` (the runtime toggle, `Core`'s twin of the config
+/// flag — see `killbill_proto::Command::SetLuksDestroyEngaged`). Invariant 4:
+/// the dangerous thing needs its own distinctly-named opt-in, and here there
+/// are deliberately two of them, config-time and runtime, neither sufficient
+/// alone. `killbilld` restarts with `luks_destroy_engaged = false` always —
+/// it is never persisted — so this can never come back silently engaged.
+fn act(cfg: &Config, reason: KillReason, luks_destroy_engaged: bool) -> Decision {
     Decision::Act(Action {
         reason,
         power: cfg.power_action,
-        luks_destroy: cfg.luks_destroy.is_some(),
+        luks_destroy: cfg.luks_destroy.is_some() && luks_destroy_engaged,
         dry_run: cfg.dry_run,
     })
 }
@@ -138,6 +165,17 @@ mod tests {
         }
     }
 
+    /// A config with an acknowledged `[response.luks_destroy]` targeting an
+    /// arbitrary `/dev` path — validity of the path itself is `config.rs`'s
+    /// concern, not policy's; this only needs `luks_destroy` to be `Some`.
+    fn config_with_luks_destroy(power: PowerAction) -> Config {
+        let mut cfg = config(1, false, power);
+        cfg.luks_destroy = Some(crate::config::LuksDestroy {
+            target_header: std::path::PathBuf::from("/dev/nvme0n1p3"),
+        });
+        cfg
+    }
+
     // --- added -----------------------------------------------------------
 
     #[test]
@@ -146,6 +184,7 @@ mod tests {
             &event(EventKind::Added, Some(STRANGER)),
             &config(1, false, PowerAction::PowerOff),
             &DeviceTable::new(),
+            false,
         );
         assert_eq!(reason(d), KillReason::UnknownDevice { id: STRANGER });
     }
@@ -156,6 +195,7 @@ mod tests {
             &event(EventKind::Added, None),
             &config(1, false, PowerAction::PowerOff),
             &DeviceTable::new(),
+            false,
         );
         assert_eq!(reason(d), KillReason::UnidentifiedDevice);
     }
@@ -166,6 +206,7 @@ mod tests {
             &event(EventKind::Added, Some(WHITELISTED)),
             &config(1, false, PowerAction::PowerOff),
             &DeviceTable::new(),
+            false,
         );
         assert_eq!(d, Decision::Ignore);
     }
@@ -178,6 +219,7 @@ mod tests {
             &event(EventKind::Added, Some(WHITELISTED)),
             &config(2, false, PowerAction::PowerOff),
             &table,
+            false,
         );
         assert_eq!(d, Decision::Ignore);
     }
@@ -190,6 +232,7 @@ mod tests {
             &event(EventKind::Added, Some(WHITELISTED)),
             &config(1, false, PowerAction::PowerOff),
             &table,
+            false,
         );
         assert_eq!(
             reason(d),
@@ -209,6 +252,7 @@ mod tests {
             &event(EventKind::Removed, Some(WHITELISTED)),
             &config(1, false, PowerAction::PowerOff),
             &DeviceTable::new(),
+            false,
         );
         assert_eq!(
             reason(d),
@@ -222,6 +266,7 @@ mod tests {
             &event(EventKind::Removed, Some(STRANGER)),
             &config(1, false, PowerAction::PowerOff),
             &DeviceTable::new(),
+            false,
         );
         assert_eq!(reason(d), KillReason::DeviceRemoved { id: Some(STRANGER) });
     }
@@ -232,6 +277,7 @@ mod tests {
             &event(EventKind::Removed, None),
             &config(1, false, PowerAction::PowerOff),
             &DeviceTable::new(),
+            false,
         );
         assert_eq!(reason(d), KillReason::DeviceRemoved { id: None });
     }
@@ -243,8 +289,8 @@ mod tests {
         let ev = event(EventKind::Added, Some(STRANGER));
         let table = DeviceTable::new();
 
-        let wet = decide(&ev, &config(1, false, PowerAction::PowerOff), &table);
-        let dry = decide(&ev, &config(1, true, PowerAction::PowerOff), &table);
+        let wet = decide(&ev, &config(1, false, PowerAction::PowerOff), &table, false);
+        let dry = decide(&ev, &config(1, true, PowerAction::PowerOff), &table, false);
 
         match (wet, dry) {
             (Decision::Act(wet), Decision::Act(dry)) => {
@@ -262,6 +308,7 @@ mod tests {
             &event(EventKind::Added, Some(STRANGER)),
             &config(1, false, PowerAction::Halt),
             &DeviceTable::new(),
+            false,
         );
         match d {
             Decision::Act(a) => assert_eq!(a.power, PowerAction::Halt),
@@ -271,11 +318,54 @@ mod tests {
 
     #[test]
     fn luks_destroy_flag_reflects_config_presence() {
-        // Default config has no luks_destroy -> flag is false.
+        // Default config has no luks_destroy and the runtime toggle is off
+        // too -> flag is false. `engaged_flag_alone_does_nothing_without_
+        // config_acknowledgment` below covers the same config with the
+        // toggle *on*, to isolate that neither flag alone is sufficient.
         let d = decide(
             &event(EventKind::Added, Some(STRANGER)),
             &config(1, false, PowerAction::PowerOff),
             &DeviceTable::new(),
+            false,
+        );
+        match d {
+            Decision::Act(a) => assert!(!a.luks_destroy),
+            Decision::Ignore => panic!("expected Act"),
+        }
+    }
+
+    #[test]
+    fn luks_destroy_requires_both_config_and_the_runtime_engaged_flag() {
+        let ev = event(EventKind::Added, Some(STRANGER));
+        let table = DeviceTable::new();
+        let cfg = config_with_luks_destroy(PowerAction::PowerOff);
+
+        // Configured and acknowledged, but not engaged at runtime -> false.
+        match decide(&ev, &cfg, &table, false) {
+            Decision::Act(a) => assert!(
+                !a.luks_destroy,
+                "must not destroy the header without the runtime engage toggle"
+            ),
+            Decision::Ignore => panic!("expected Act"),
+        }
+
+        // Configured, acknowledged, AND engaged -> true.
+        match decide(&ev, &cfg, &table, true) {
+            Decision::Act(a) => assert!(a.luks_destroy),
+            Decision::Ignore => panic!("expected Act"),
+        }
+    }
+
+    #[test]
+    fn engaged_flag_alone_does_nothing_without_config_acknowledgment() {
+        // The mirror of the above: engaged = true but no [response.luks_destroy]
+        // in config at all -> still false. Neither flag alone is sufficient
+        // (invariant 4).
+        let d = decide(
+            &event(EventKind::Added, Some(STRANGER)),
+            &config(1, false, PowerAction::PowerOff),
+            &DeviceTable::new(),
+            true,
         );
         match d {
             Decision::Act(a) => assert!(!a.luks_destroy),
@@ -291,6 +381,7 @@ mod tests {
             &event(EventKind::Added, Some(WHITELISTED)),
             &cfg,
             &DeviceTable::new(),
+            false,
         );
         assert_eq!(reason(d), KillReason::UnknownDevice { id: WHITELISTED });
     }

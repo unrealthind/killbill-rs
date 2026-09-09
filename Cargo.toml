@@ -1,32 +1,58 @@
 [workspace]
 resolver = "2"
-members = ["killbill-proto", "killbilld", "killbillctl"]
+members = ["killbill-proto", "killbilld", "killbillctl", "killbill-tui"]
 
-# Phase 2 adds "killbill-tui"; Phase 3 adds packaging. Neither exists yet.
+# Phase 3 adds packaging; it does not exist yet.
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-license = "GPL-2.0-or-later"
+license = "GPL-3.0-or-later"
 
 [workspace.dependencies]
 killbill-proto = { path = "killbill-proto" }
 
-# Shared third-party versions. The async/netlink/socket stack (tokio, …) lands
-# with the USB sensor and control server in steps 5–6; steps 1–4 stay sync and
-# (bar the Linux poweroff syscall) platform-neutral.
+# Shared third-party versions. The daemon runs on `std::thread` + channels
+# throughout (sensor, responders, control server) — no async runtime; see
+# `PROJECT_CHARTER.md` §13.1. Only two pieces are platform-bound, both via `nix`
+# on Linux: the poweroff syscall and the netlink uevent socket.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 toml = "0.8"
 tracing = "0.1"
 
-# Linux-only, `reboot` feature only: the poweroff syscall as a typed wrapper,
-# never a shelled-out command (invariant 6). The arm-time capability check
-# reads `/proc/self/status` with `std` — no `nix` "user" feature (that also
-# pulls NSS-backed lookups that can block). Pulled in only under
-# `[target.'cfg(target_os = "linux")'.dependencies]`.
-nix = { version = "0.29", features = ["reboot"] }
+# Binary boundaries only (main.rs / killbillctl): anyhow for error context,
+# clap for the CLI, tracing-subscriber + tracing-appender for the daemon's
+# non-blocking log sink (the kill path must never park behind a log write).
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+# `fmt` only — no `ansi` (journald needs no colour), no `env-filter` (no regex
+# pulled into a root daemon). Level is set with `.with_max_level`.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
+tracing-appender = "0.2"
+
+# Phase 2 TUI only (`killbill-tui`). ratatui bundles crossterm and re-exports it
+# as `ratatui::crossterm`, so the client pins one version, not two. The TUI is a
+# pure protocol client — no async runtime, no daemon deps.
+ratatui = "0.29"
+
+# Unix-only. `reboot`: the poweroff syscall as a typed wrapper (invariant 6).
+# `socket`: the AF_NETLINK/NETLINK_KOBJECT_UEVENT uevent socket (USB sensor) and
+# the AF_UNIX/SOCK_SEQPACKET control socket — covers `setsockopt`/`SO_RCVTIMEO`,
+# `NetlinkAddr`, `UnixAddr`, `listen`/`accept`/`connect`, `SO_PEERCRED`.
+# `user`: `geteuid` (startup root check) and the `Uid`/`Gid` newtypes for the
+# socket `chown` — pure getuid/setuid-family syscalls only. The NSS-backed
+# lookups (`User::from_name`, `Group::from_name`) that can block on a slow name
+# service are NOT used anywhere and must stay unused.
+# `fs`: `umask` around the socket bind.
+# Every syscall goes through nix's safe wrappers so `#![deny(unsafe_code)]`
+# holds with no exception.
+nix = { version = "0.29", features = ["reboot", "socket", "user", "fs"] }
+
+# Termination-signal handling without hand-rolled `unsafe` sigaction. The
+# handler thread checks `kill_in_flight()` and never disarms (invariant 5).
+signal-hook = "0.3"
 
 [profile.release]
 # NOT a size knob — do not switch to "abort". Responders run on independent
