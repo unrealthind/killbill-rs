@@ -4,7 +4,8 @@
 //!
 //! * a **[`Command`]** → the daemon answers with one **[`Reply`]**, then the
 //!   connection closes;
-//! * a **[`Command::Subscribe`]** → the daemon streams **[`Event`]s** on the
+//! * a **[`Command::Subscribe`]** → the daemon replays its event backlog and
+//!   then streams live events, both as **[`StreamEvent`]** frames, on the
 //!   connection until it closes.
 //!
 //! Framing is the length-prefixed JSON codec in [`killbill_proto`]. Over
@@ -60,7 +61,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use killbill_proto::{decode, encode, Command, Event, Reply, MAX_CONTROL_FRAME};
+use killbill_proto::{decode, encode, Command, Reply, StreamEvent, MAX_CONTROL_FRAME};
 
 use crate::StopFlag;
 
@@ -94,14 +95,25 @@ pub enum ControlRequest {
         peer: PeerCred,
         reply: SyncSender<Reply>,
     },
-    /// An event subscription from `peer`. The core answers `ack` (Ok, or an
-    /// Error if refused) and then pushes [`Event`]s on `events` (lossily,
-    /// dropping on a full or dead channel) until it goes away.
+    /// An event subscription from `peer`. The core answers `ack` and then
+    /// pushes [`StreamEvent`]s on `events` (lossily, dropping on a full or
+    /// dead channel) until it goes away.
     Subscribe {
         peer: PeerCred,
-        events: SyncSender<Event>,
-        ack: SyncSender<Reply>,
+        events: SyncSender<StreamEvent>,
+        ack: SyncSender<SubscribeOutcome>,
     },
+}
+
+/// The core's answer to a [`ControlRequest::Subscribe`]. Never itself put on
+/// the wire — `reply` is what the connection thread sends as the ack frame
+/// (`Reply::Ok` or `Reply::Error`); `backlog` (empty on refusal) is what it
+/// then replays as individual [`StreamEvent`] frames before switching to
+/// forwarding live ones from `events` (charter §8: the connection thread does
+/// the replay, never the core thread — see [`serve_subscription`]).
+pub struct SubscribeOutcome {
+    pub reply: Reply,
+    pub backlog: Vec<StreamEvent>,
 }
 
 /// How long `serve` blocks in `accept` before re-checking the stop flag.
@@ -452,8 +464,8 @@ fn serve_connection(mut stream: UnixStream, core: &Sender<ControlRequest>) {
 }
 
 fn serve_subscription(mut stream: UnixStream, peer: PeerCred, core: &Sender<ControlRequest>) {
-    let (events_tx, events_rx) = sync_channel::<Event>(SUBSCRIBER_QUEUE);
-    let (ack_tx, ack_rx) = sync_channel::<Reply>(1);
+    let (events_tx, events_rx) = sync_channel::<StreamEvent>(SUBSCRIBER_QUEUE);
+    let (ack_tx, ack_rx) = sync_channel::<SubscribeOutcome>(1);
     if core
         .send(ControlRequest::Subscribe {
             peer,
@@ -472,20 +484,48 @@ fn serve_subscription(mut stream: UnixStream, peer: PeerCred, core: &Sender<Cont
     // The core answers the ack (Ok, or an Error if it refused the subscription)
     // before it registers the subscriber — write the real outcome, not an
     // optimistic Ok, so `killbillctl events` can tell "refused" from "no events".
-    let ack = ack_rx
-        .recv()
-        .unwrap_or_else(|_| Reply::Error("daemon dropped the subscription".to_owned()));
-    let accepted = matches!(ack, Reply::Ok);
-    if write_frame(&mut stream, &ack).is_err() || !accepted {
+    let outcome = ack_rx.recv().unwrap_or_else(|_| SubscribeOutcome {
+        reply: Reply::Error("daemon dropped the subscription".to_owned()),
+        backlog: Vec::new(),
+    });
+    let accepted = matches!(outcome.reply, Reply::Ok);
+    if write_frame(&mut stream, &outcome.reply).is_err() || !accepted {
         return;
+    }
+
+    // Replay the backlog as individual frames — never one batched frame (see
+    // `Command::Subscribe`'s doc comment) — before switching to live events.
+    for stream_event in outcome.backlog {
+        if !write_event_frame(&mut stream, &stream_event) {
+            return;
+        }
     }
 
     // Forward events until the client disconnects (a write fails or times out)
     // or the core drops its sender (daemon shutdown / this subscriber pruned).
     for event in events_rx {
-        if write_frame(&mut stream, &event).is_err() {
+        if !write_event_frame(&mut stream, &event) {
             break;
         }
+    }
+}
+
+/// Write one backlog or live `StreamEvent` frame. Returns `false` when the
+/// connection itself is the problem (a real I/O failure — the client is gone,
+/// stop replaying) and `true` when a merely-oversized frame was skipped: an
+/// `encode` rejection (`ErrorKind::InvalidData`, capped in practice by
+/// `daemon::truncate_for_broadcast`, but defended here too) is this one
+/// event's problem, not the connection's, and must not silently end the
+/// subscription for every event after it — the daemon's own log always has
+/// the untruncated original.
+fn write_event_frame(stream: &mut UnixStream, event: &StreamEvent) -> bool {
+    match write_frame(stream, event) {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+            tracing::warn!(error = %e, "skipping one event frame too large to send");
+            true
+        }
+        Err(_) => false,
     }
 }
 

@@ -6,11 +6,16 @@
 //! protocol lacks, that goes into `killbill-proto` *and* `killbillctl` — never a
 //! TUI-only side channel.
 //!
-//! This is the Phase 2 skeleton (plan build-order step 3 + start of step 4):
-//! the two-connection transport, a crash-safe render loop, the armed-state
-//! band, the live device list, and the main-menu shell. The remaining screens
-//! (whitelist, settings, dry-run, event log, config, LUKS destroy) are menu
-//! placeholders until their build-order steps.
+//! Through plan build-order step 12: the two-connection transport, a
+//! crash-safe render loop, the armed-state band, and the Devices, Whitelist,
+//! Settings, Dry-run, Event-log, Config-inspector, Help and fenced
+//! LUKS-destroy screens. Plug-and-whitelist works end to end (device action
+//! modal → `WhitelistAdd`/`WhitelistRemove` → reacting to `WhitelistChanged`);
+//! Arm/Disarm/Reload go through a confirm modal; the LUKS-destroy screen
+//! toggles the runtime `engaged` flag behind a typed-`DESTROY` fence (the wipe
+//! itself stays a stub — invariant 3). Build-order step 13 (the four-agent
+//! sign-off plus the manual NO_COLOR / resize / `kill -9` checks) is still
+//! owed, along with the earlier review gates.
 
 #![forbid(unsafe_code)]
 

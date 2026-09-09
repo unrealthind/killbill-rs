@@ -23,8 +23,9 @@ pub mod sensor_event;
 
 pub use action::{Action, KillReason, PowerAction};
 pub use protocol::{
-    decode, encode, sanitize_device_string, Command, DeviceInfo, Event, ProtocolError, Reply,
-    StatusPayload, WhitelistEntry, MAX_BODY_LEN, MAX_CONTROL_FRAME, MAX_DEVICE_STRING,
+    decode, encode, rfc3339_now, sanitize_device_string, Command, ConfigChange, ConfigPayload,
+    DeviceInfo, Event, LuksDestroyInfo, OnSensorGap, ProtocolError, Reply, StatusPayload,
+    StreamEvent, WhitelistEntry, MAX_BODY_LEN, MAX_CONTROL_FRAME, MAX_DEVICE_STRING,
 };
 pub use sensor_event::{
     DeviceIdentity, EventKind, SensorEvent, SensorSource, UsbId, UsbIdParseError,

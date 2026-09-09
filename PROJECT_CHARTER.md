@@ -140,7 +140,7 @@ A **separate binary** so a UI crash can never touch protection. Connects to the 
 
 The dependable, scriptable, headless-friendly path. Everything the TUI can do, the CLI can do — the TUI is a nicety on the same protocol, never the only way in.
 
-Commands: `status`, `arm`, `disarm`, `test` (dry-run), `whitelist add|remove|list`, `reload`.
+Commands: `status`, `arm`, `disarm`, `test` (dry-run), `whitelist add|remove|list`, `reload`, `config show|set <field> <value>`, `luks engage <on|off>`, `events [--follow]`.
 
 ---
 
@@ -148,11 +148,13 @@ Commands: `status`, `arm`, `disarm`, `test` (dry-run), `whitelist add|remove|lis
 
 One `SOCK_SEQPACKET` Unix socket at `/run/killbilld.sock`. Three traffic types:
 
-- **Commands (client → daemon, expect reply):** `GetStatus`, `ListDevices`, `Arm`, `Disarm`, `WhitelistAdd(entry)` (upsert by id), `WhitelistRemove(id)`, `WhitelistList`, `RunDryRun`, `ReloadConfig`, `Subscribe`.
-- **Replies (daemon → client):** `Ok`, `Status(payload)`, `Devices(list)`, `Whitelist(entries)`, `DryRun(reasons)`, `Error(message)`.
-- **Event stream (daemon → client, unsolicited, to subscribers):** `DeviceAdded`, `DeviceRemoved`, `Armed`, `Disarmed`, `WouldKill(reason)` (dry-run), `SensorStopped` (the USB sensor thread died — daemon is exiting non-zero for a supervisor restart), `EventsLost` (the kernel receive buffer overflowed and add/remove events were dropped).
+- **Commands (client → daemon, expect reply):** `GetStatus`, `ListDevices`, `Arm`, `Disarm`, `WhitelistAdd(entry)` (upsert by id), `WhitelistRemove(id)`, `WhitelistList`, `RunDryRun`, `ReloadConfig`, `GetConfig`, `ConfigSet(change)`, `SetLuksDestroyEngaged(bool)`, `Subscribe`.
+- **Replies (daemon → client):** `Ok`, `Status(payload)`, `Devices(list)`, `Whitelist(entries)`, `DryRun(reasons)`, `Config(payload)`, `Error(message)`.
+- **Event stream (daemon → client, unsolicited, to subscribers):** `DeviceAdded`, `DeviceRemoved`, `Armed`, `Disarmed`, `WouldKill(reason)` (dry-run — now also broadcast for an armed dry-run kill on the normal event path, not just `RunDryRun`), `SensorStopped` (the USB sensor thread died — daemon is exiting non-zero for a supervisor restart), `EventsLost` (the kernel receive buffer overflowed and add/remove events were dropped), `WhitelistChanged`, `ConfigChanged`, `ReloadFailed(reason)`. Every event on the wire is wrapped in a `StreamEvent { at, event }` envelope (`at` is an RFC 3339 UTC timestamp) — a new subscriber's ack is followed by its event backlog (the last 200 broadcasts, oldest first) replayed as individual `StreamEvent` frames, then live ones, both the same frame shape.
 
 `WhitelistList` / `Reply::Whitelist` and `Reply::DryRun` were added in Phase 1 step 6 so `killbillctl whitelist list` and `killbillctl test` (§7.3) work over the protocol rather than reading the file. `StatusPayload` gained `sensor_ok` (false when the USB sensor thread has died) and `events_lost` (sticky once the sensor reports a gap). The `SensorStopped` / `EventsLost` events mirror those. When the sensor is not running, or `events_lost` is set under `on_sensor_gap = "warn"`, the daemon refuses to arm (invariant 7); under `on_sensor_gap = "kill"` a gap fires the power action (`KillReason::SensorGap`). All additive to `#[non_exhaustive]` types.
+
+**Phase 2 step 1 additions.** `GetConfig` answers a read-only `ConfigPayload` snapshot of the *running* (validated) config — never a reflection of a broken on-disk file; `validation_error` carries why they might differ. `ConfigSet(ConfigChange)` changes one field (`DryRun`, `PowerAction`, `ArmedAtBoot`, `Sensors`, `OnSensorGap`) the same way `WhitelistAdd` does: applied to a clone of the raw config, the whole thing re-validated, and only on success written and swapped (invariant 2) — nothing is a partial update. `SetLuksDestroyEngaged(bool)` is `Core`'s own `luks_destroy_engaged` flag, refused unless the running config has an acknowledged `[response.luks_destroy]`. This is deliberately a *second*, purely runtime, opt-in on top of the config-time `i_understand_this_is_irreversible` acknowledgment (invariant 4) — `Action::luks_destroy` requires both, never persisted, and always starts `false` on daemon start. All three commands sit on the closed `requires_root` allow-list (privileged by default) alongside `Arm`/`Disarm`/the whitelist commands, even though `GetConfig` is read-only, because `LuksDestroyInfo::target_header` is as sensitive as anything else gated there.
 
 **Framing:** length-prefixed messages. **Serialization:** serde + JSON for v1 (readable and debuggable for a learning codebase; swappable to a binary codec later without changing the protocol shape).
 

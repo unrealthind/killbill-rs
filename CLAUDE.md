@@ -114,10 +114,12 @@ Findings deliberately **deferred** — do not re-raise these as new, and do not
   connection while the daemon closes after a single reply — every second command
   fails — and has no socket timeouts, no `config_stale` in the status band, and a
   stale armed-state cache on disconnect. Its `MAX_MSG` (128 KiB) claims in a
-  comment to mirror `killbillctl` (64 KiB); it does not.
-- *Phase 2 (protocol).* An armed **dry-run** kill broadcasts nothing to
-  subscribers, so a client watching a dry-run daemon sees a device appear and
-  then silence. Needs a protocol-visible event.
+  comment to mirror `killbillctl` (64 KiB); it does not. **New as of step 1–2**:
+  `client.rs` still decodes a subscription's post-ack frames as bare `Event`;
+  the daemon now sends `StreamEvent { at, event }` for both the backlog replay
+  and every live push, so this will fail to decode against a real daemon until
+  step 4 fixes it — decode `StreamEvent` and read `.event`, same as
+  `killbillctl`'s `stream_events` now does.
 - *Phase 3.* `killbilld.service` needs `SendSIGKILL=no` (or a long
   `TimeoutStopSec`) or systemd will kill a daemon deliberately parked on
   `kill_in_flight`. And `bind_listener` should refuse to start when the socket's
@@ -182,6 +184,468 @@ it — never point a unit's `ExecStart` at a path under a user's home directory.
 **Phase 2 is formally underway** — `killbill-tui/` is a ratatui skeleton on the
 same branch, started before the hardware gate passed but now in correct phase
 order. Its known defects are the Phase 2 list above.
+
+**Phase 2 steps 1–3 are implemented, fixed against one review round, and
+build/test-clean.** `cargo fmt --all`, `cargo clippy --workspace --all-targets
+-- -D warnings`, and `cargo test --workspace` are all green — 187 tests (the
+161-test Phase 1 baseline plus 26 new: protocol round-trip/`rfc3339` tests,
+policy engine two-opt-in tests, and daemon tests for `GetConfig`/`ConfigSet`/
+`SetLuksDestroyEngaged`/the event backlog/the `WouldKill` fix). `security-
+auditor`, `kill-path-reliability`, and `code-quality` each reviewed the diff
+before the fixes below (all three read-only, source + `git` only).
+`code-quality` returned a clean PASS (a few non-blocking "consider" items,
+listed below). `security-auditor` and `kill-path-reliability` both returned
+**BLOCK**, converging independently on the same core gap plus one each of
+their own; all of those are fixed, each with a regression test:
+
+**Note for whoever picks this up next: the fixes below have not been
+re-reviewed.** The review agents ran once, against the pre-fix diff; their
+findings were addressed and the fixes are covered by new tests and traced by
+hand, but no agent has confirmed the *post-fix* diff. This was a deliberate
+choice (2026-09-08) to proceed to step 4 rather than spend another review
+round first — treat steps 1–3 as high-confidence, not signed off, and get a
+confirmation pass (at least `security-auditor` + `kill-path-reliability`,
+scoped to just the three fixes below) before or alongside step 13's full-tree
+sign-off, the way Phase 1's sign-off worked.
+
+- **Fixed.** `swap_config` cleared the runtime `luks_destroy_engaged` toggle
+  only when `luks_destroy` disappeared entirely — a config change that kept
+  `luks_destroy` present but *retargeted* `target_header` at a different
+  device silently carried the old engagement over to a target the operator
+  never confirmed. Now cleared whenever the target changes at all, not only
+  when it vanishes; covered by two new tests (retarget clears it, an
+  unrelated `config_set` does not).
+- **Fixed.** The armed-dry-run `WouldKill` broadcast (below) originally fired
+  only for `action.dry_run`. `power_action = "none"` is the *other* documented
+  safety belt (both are used throughout the step-0 hardware-gate protocol) and
+  is equally silent to a subscriber — the kill dispatches for real, but the
+  poweroff responder's plan is `Skip`. Now fires for `action.dry_run ||
+  action.power == PowerAction::None`; covered by tests for both belts plus a
+  negative test that a genuine kill (neither belt on) does *not* also claim to
+  be a would-kill.
+- **Fixed.** `Event::ReloadFailed`'s reason is a whole `ValidationReport`,
+  unbounded in principle (e.g. a config with hundreds of malformed whitelist
+  entries) — a single broadcast could exceed `MAX_CONTROL_FRAME`. Unlike a
+  direct command reply (already handled — `control::serve_connection`
+  substitutes a small "too large" error), an unsendable *broadcast* had
+  nowhere to go and would sit poisoned in `event_backlog`, breaking replay for
+  every subsequent subscriber. Fixed at the source (`daemon::
+  truncate_for_broadcast`, 4 KiB cap, full report still in the direct
+  `Reply::Error` and the log) *and* defensively in `control::
+  write_event_frame` (an oversized frame is now skipped with a `tracing::warn!`,
+  never drops the connection) — belt and suspenders, per both reviewers'
+  recommendation.
+
+**Deliberately deferred, not fixed** — low-severity findings from the same
+review round; do not "fix" these ad hoc without reading why they were left:
+
+- The backlog snapshot in `Core::subscribe` deep-clones up to 200
+  `StreamEvent`s on the single authority thread before handing them to the
+  connection thread to replay. Bounded and root-gated, but a tight
+  subscribe/disconnect loop could add repeated small delays ahead of a queued
+  USB event. A future fix would use `VecDeque<Arc<StreamEvent>>` so the
+  snapshot is pointer clones; not done here to avoid widening this diff
+  further after two BLOCK rounds already landed.
+- `SetLuksDestroyEngaged(true)` does not re-run the LUKS-target preflight
+  (exists-and-is-a-block-device) at engage time — only `arm` and a config swap
+  do. Harmless while the responder is a stub (invariant 3); tighten before the
+  wipe is ever implemented.
+- **DECIDED (2026-09-08): `Disarm` clears `luks_destroy_engaged`.** The
+  destructive opt-in is scoped to a single armed session — a disarm clears the
+  runtime toggle, so re-engaging always means walking the typed-`DESTROY`
+  fence again. Already cleared on daemon restart and on a config target
+  change; this adds disarm. Implemented in `Core::disarm` (logs `peer_uid`/
+  `peer_pid`, broadcasts `Event::ConfigChanged` so other clients re-fetch),
+  covered by `disarm_clears_the_luks_destroy_engage_toggle`.
+- `swap_config` picks `WhitelistChanged` vs `ConfigChanged` by checking
+  whether `label` starts with `"whitelist"` rather than a dedicated
+  `ChangeKind` enum threaded through `WriteJob`/`Msg`. `code-quality` flagged
+  this as stringly-typed; it is safe today (every `label` is an internal
+  `&'static str`, never client input) and is covered by a test per broadcast
+  kind, but a real enum would make a future mismatch a compile error instead
+  of a silently-wrong event. Worth doing if this area is touched again.
+- `Event::ReloadFailed`'s reason and `ConfigPayload`'s `target_header`/
+  `validation_error` are rendered by `killbillctl` without
+  `sanitize_device_string`. These strings originate in the root-owned config
+  file (not a privilege boundary — `security-auditor` did not flag it as a
+  finding), but it's the one place raw file content reaches a terminal
+  unsanitized. Low priority; revisit if either becomes attacker-influenced.
+
+What steps 1–3 changed:
+
+- `killbill-proto`: `OnSensorGap` (wire twin of `SensorGapAction`),
+  `LuksDestroyInfo`, `ConfigPayload`, `ConfigChange`, `StreamEvent { at, event
+  }`, `rfc3339_now` (hand-rolled RFC 3339 UTC formatter — no date crate
+  pulled in for one timestamp string). New commands `GetConfig`, `ConfigSet`,
+  `SetLuksDestroyEngaged` (all privileged — the closed `requires_root`
+  allow-list needed no code change, only new test assertions).
+  `Command::Subscribe`'s ack is still a bare `Reply::Ok`/`Error` — no new
+  `Reply` variant for it — but everything after the ack, backlog and live
+  alike, is now a `StreamEvent` frame, individually, never batched.
+- `killbilld`: `policy::decide` gained a fourth parameter,
+  `luks_destroy_engaged: bool` — `Action::luks_destroy` is now `cfg.
+  luks_destroy.is_some() && luks_destroy_engaged`, i.e. two opt-ins, config-
+  time and runtime, neither sufficient alone (invariant 4). `Core` gained
+  `luks_destroy_engaged` (never persisted, always `false` on daemon start,
+  cleared by `swap_config` whenever the new config drops `luks_destroy` *or*
+  points it at a different `target_header`) and
+  `event_backlog: VecDeque<StreamEvent>` (cap 200, appended in `broadcast`,
+  replayed by the *connection thread* on subscribe — never the core thread).
+  Fixed the deferred defect: an armed dry-run kill now also broadcasts
+  `WouldKill` from `on_sensor_event` itself, not just from `RunDryRun`.
+  `WhitelistChanged`/`ConfigChanged` are broadcast from `swap_config` (picked
+  by whether `label` starts with `"whitelist"` — safe because every `label`
+  is a `&'static str` this module itself supplies, never client input);
+  `ReloadFailed(reason)` is broadcast from all three `on_config_reloaded`
+  rejection paths, alongside the existing `config_stale = true` /
+  `Reply::Error`.
+- `killbillctl`: `config show`, `config set dry-run|power-action|armed-at-boot
+  |sensors|on-sensor-gap <value>`, `luks engage <on|off>`, and `events
+  [--follow]` — without `--follow` it now drains just the backlog (a short
+  read timeout after the ack, since the daemon writes the whole backlog
+  immediately and there is no explicit backlog-end marker on the wire) and
+  exits, rather than blocking forever.
+
+**Phase 2 step 4 (TUI transport repair) is implemented and build/test-clean**
+(`cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`,
+`cargo test --workspace` all green — 195 tests, the 187-test steps-1–3
+baseline plus 8 new in `killbill-tui`). **Review deferred by the operator's own
+choice** (2026-09-08: "we will run review gate later") — `code-quality` +
+`tui-ux`, the pair the plan calls for on this step, were launched once and
+both **errored out on a session rate limit** before reviewing anything; that
+attempt does not count as a completed pass. Run the review gate — now scoped
+to steps 4–6 together, since 5 and 6 landed on top of 4 before any review
+happened — before or alongside step 7. All in `killbill-tui/`:
+
+- `client.rs`: the connection-reuse defect is fixed — `ClientHandle::call`
+  now opens a fresh `SOCK_SEQPACKET` connection per call instead of trying to
+  reuse one, matching the daemon's actual one-shot-per-connection contract
+  (`serve_connection` answers exactly one command then closes). Both the
+  command connection and the event connection now carry read/write timeouts
+  (`COMMAND_TIMEOUT` = 5s, `EVENT_READ_TIMEOUT` = 30s — a timeout on the event
+  connection is treated as "nothing happened yet", not a disconnect, since a
+  quiet system can legitimately go longer than that between USB events).
+  `MAX_MSG` (128 KiB, claimed-not-actual parity with `killbillctl`) is gone;
+  both connections now size their buffer from `killbill_proto::
+  MAX_CONTROL_FRAME` directly. The event connection decodes `StreamEvent` now
+  (it was still decoding bare `Event`, which would have failed against a real
+  post-step-2 daemon — the defect flagged in the deferred-findings list above
+  is fixed by this). A new `Client` trait (`ClientHandle` is the production
+  impl) lets `App`'s reducer be driven by a canned `ScriptedClient` in tests,
+  with no socket (the plan §11 `TODO` this closes).
+- `app.rs`: `App` is now generic over `Client` (`App<C: Client = ClientHandle>`
+  — every existing bare-`App` reference elsewhere resolves via the default, no
+  other file changed). `on_event` takes the full `StreamEvent` (the timestamp
+  is unused until the event-log screen, step 10, but the wire-format plumbing
+  for it is already in place). Added handling for `WhitelistChanged`/
+  `ConfigChanged`/`ReloadFailed` — previously fell into the generic
+  `#[non_exhaustive]` catch-all. New reducer tests using `ScriptedClient`.
+- `ui/statusbar.rs`: fixed the deferred "stale armed-state cache on
+  disconnect" defect — while `Conn::Down`, the headline glyph/word no longer
+  claims live truth from the cached `status` (`"● ARMED"`); it now reads
+  `"? LAST KNOWN: ARMED"`/`"? LAST KNOWN: DISARMED"`, and the secondary detail
+  row (dry-run, sensor health, events-lost, whitelist/device counts) — every
+  bit as stale — is suppressed entirely rather than shown as current. Also
+  added the missing `config_stale` tag next to `EVENTS LOST`.
+- Step 4 did not touch (now addressed by steps 5/6 below, or still open):
+  `ui/devices.rs`'s `sanitize_device_string` gap (step 5, fixed), the device
+  list still rendering unconditionally during `Conn::Down` (still open, not on
+  any step's defect list yet), and `Intent::Reconnect` still being cosmetic
+  (`set_toast` only — the background thread already retries on its own timer
+  regardless of the keypress; not a correctness issue, just a slightly
+  misleading hint string, still open, not on any step's list).
+
+**Phase 2 steps 5 and 6 (Devices screen finish + plug-and-whitelist) are
+implemented and build/test-clean** (`cargo fmt --all`, `cargo clippy
+--workspace --all-targets -- -D warnings`, `cargo test --workspace` all
+green — 206 tests, the 195-test step-4 baseline plus 11 new: the sanitize
+regression test plus 10 covering the device-action/whitelist-add/remove
+reducer flow). Two real bugs surfaced and were fixed before the human's build
+was clean, neither by a review agent (none has run yet):
+
+- A first `cargo test` run failed to compile: `Intent::ToggleMenu`'s
+  `match self.modal { Some(Modal::Menu {..}) => None, None => ... }` predated
+  the three new `Modal` variants and was no longer exhaustive. Fixed by
+  routing every other `Some(_)` (a device-action/whitelist modal open when `m`
+  is pressed) to replace it with the main menu, rather than adding a
+  `todo!()` — `m` is a global key per the design doc and doing nothing would
+  have been the wrong fix, not just an exhaustiveness patch.
+- After that, `cargo test` compiled but one new test failed on real semantics,
+  not a bad assertion: `move_cursor`'s `delta` is list-cursor sign (`Up` =
+  `-1`, moving to an earlier row), which is the opposite of what `↑`/`↓`
+  should mean for the whitelist-add modal's `max_count` **stepper** — `Up`
+  was decreasing the count. Fixed by negating `delta` in that one match arm
+  only; the list-cursor arms are untouched. The modal's own hint text already
+  said "↑↓ adjust" implying `Up` increases, so this was a real inversion, not
+  a test written backwards.
+
+Both are described together here (rather than getting their own status
+blocks) since they're small and land on unreviewed step 4 — the pending
+review gate above now covers all three.
+
+- Step 5 turned out to be almost entirely the one listed defect:
+  `ui/devices.rs` rendered `label`/`serial` via bare `Span::raw`, the one
+  place in the workspace that skipped `sanitize_device_string`. Fixed by
+  pulling the row-building code into its own `device_line` function so the
+  sanitize call has one call site and its own test (a hostile label/serial —
+  an ANSI escape and a non-ASCII byte — asserted absent from the rendered
+  spans). The rest of the design-doc §7 status-band spec (glyph+word never
+  colour-only, `DRY-RUN` tag, `CONFIG INVALID` red state, `sensor_ok` /
+  `events_lost` / `config_stale`) was already delivered by step 4's
+  `statusbar.rs` rewrite — nothing left to add there.
+- Step 6: `Enter` on a device row (with an id — a device with none has
+  nothing to key a whitelist entry on, invariant 7) opens a device action
+  modal (`Modal::DeviceAction`) offering "Add to whitelist…" or "Remove from
+  whitelist" depending on `DeviceInfo.whitelisted`, plus Cancel, both ending
+  in `Command::WhitelistAdd`/`WhitelistRemove`. Add has a second step
+  (`Modal::WhitelistAddCount`) to pick `max_count` via `↑`/`↓` (default 1,
+  capped at a UI-only 32 — no free-text entry yet, that's a later polish, not
+  a protocol limit); Remove has a confirm step (`Modal::ConfirmRemove`) since
+  it's a protection-relevant action while armed. Every confirm re-reads the
+  device at its stored index rather than trusting what was true when the
+  modal opened, and reports rather than panics if the device vanished
+  (unplugged) while the modal sat open — covered by a regression test.
+  `Event::WhitelistChanged` now also calls `refresh_devices()` (previously
+  toast-only) — `DeviceInfo.whitelisted` is derived from the whitelist, so
+  the Devices screen's NEW/ok marks would otherwise go stale after a
+  successful add/remove, this client's own or another client's.
+- Not built for either step: the design doc's "View raw uevent" device-action
+  option (no raw-uevent data exists on `DeviceInfo` — out of protocol scope,
+  not just out of TUI scope, so not attempted here) and editing an existing
+  whitelist entry's `label`/`max_count` in place (that belongs to the
+  Whitelist screen, step 8, which can show absent/disconnected entries this
+  modal never sees).
+
+**Phase 2 steps 7–12 (confirm modals + Whitelist / Settings / Dry-run /
+Event-log / Config-inspector / Help / fenced LUKS-destroy screens) are
+implemented — NOT yet reviewed, and NOT yet re-verified by the operator's
+build.** Steps 7–10 were written 2026-09-08 at the operator's request to
+finish the UI layer without a review gate; steps 11–12 followed the same day,
+same instruction ("upto step 10 is done finish the rest"). At the 7–10 mark
+`cargo fmt --all` / `clippy --workspace --all-targets -- -D warnings` /
+`cargo test --workspace` were green — 224 tests (37 `killbill-proto` + 39
+`killbill-tui` + 148 `killbilld`). Steps 11–12 add ~9 more `killbill-tui`
+reducer tests (config/help/luks-destroy menu targets, the typed-`DESTROY`
+fence: wrong word cancels, exact word then `y`/`Y` sends
+`SetLuksDestroyEngaged`, any other key cancels, unconfigured refuses) — the
+7–10 gate's "trace the reducer by hand, the green tests prove compilation not
+intent" caveat applies here too, and this batch has NOT been compiled by the
+operator yet. **No review agent has seen any of steps 4–12.** Still owed
+before step 13's sign-off: the deferred steps 1–3 confirmation pass, and a
+steps 4–12 review gate — `code-quality` + `tui-ux` across the lot, plus
+`security-auditor` + `kill-path-reliability` on the Arm/Disarm confirm path
+**and** the LUKS-destroy screen (plan §8 mandates all three on that file).
+
+**Review-gate attempt 2026-09-08 (post-Conn::Down-fix): all four agents
+launched, all four died on the session rate limit** (`security-auditor` /
+`kill-path-reliability` on Opus 5, `code-quality` / `tui-ux` on Sonnet 5;
+"resets 8pm America/Edmonton"). `kill-path-reliability` got far enough to
+say Part A (the steps 1–3 daemon fixes) "looks solid" before it was cut off —
+not a completed pass, but a data point. A by-hand self-review the same day
+(reading only, no build) walked all three steps 1–3 fixes — `swap_config`
+target-change clearing, the `dry_run || power == None` `WouldKill` broadcast,
+and `truncate_for_broadcast` + `write_event_frame`'s `InvalidData` skip — and
+found them correct.
+
+**Review gate RUN 2026-09-08 (steps 1–12, full working tree vs `a66c5c7`):**
+all four agents completed a real read-only pass.
+
+- `code-quality` — **PASS**, nothing blocking (9 polish items).
+- `tui-ux` — **PASS**, no blockers (4 should-fix).
+- `kill-path-reliability` — **PASS**. Confirmed the steps 1–3 daemon fixes
+  each correct, complete, and off the kill path; two-opt-in enforced at the
+  daemon. Raised H1/H2 as a fail-open surface (fixed below).
+- `security-auditor` — **BLOCK** on one finding + 4 mediums it asked be
+  fixed in the same pass. Confirmed steps 1–3 correct; invariants 3/6/8
+  clean; zero `unsafe`; zero new deps; authz allow-list still closed.
+
+**All BLOCK/High/Medium findings fixed in the same pass** (2026-09-08), each
+with a regression test where behavioural:
+
+- *(sec BLOCK #1)* the `DESTROY` fence now captures `target_header` when it
+  opens (`App::destroy_target`), renders it in both fence modals, and
+  `App::set_luks_destroy_engaged` re-verifies it against the current config
+  before sending — a concurrent `reload`/`config set` that repoints the
+  target under the open fence now aborts with a toast, nothing sent
+  (`destroy_fence_aborts_if_the_target_was_repointed_while_it_was_open`).
+- *(sec #2)* `Core::config_set` and `Core::set_luks_destroy_engaged` take
+  `PeerCred` and log `peer_uid`/`peer_pid`, same as `arm`/`disarm`.
+- *(sec #3)* `set_luks_destroy_engaged` broadcasts `Event::ConfigChanged` on
+  a real change so other clients re-fetch the engaged state.
+- *(sec #4 / kp L3)* the "will wipe the header" wording in `app.rs`,
+  `ui/config.rs` and `killbillctl` now matches `ui/destroy.rs` — v1 records
+  intent only, the wipe is a stub, the header is not touched.
+- *(sec #5)* the `on_sensor_event` `WouldKill` broadcast now fires for
+  `dry_run || (power == None && !luks_destroy)` — a `power = none` kill that
+  still runs the LUKS responder for real is not announced as hypothetical
+  (`armed_kill_with_power_none_but_luks_destroy_engaged_does_not_broadcast_would_kill`).
+- *(sec #6)* `truncate_for_broadcast` scrubs C0/C1 control bytes (keeping
+  `\n`/`\t`) before a reason goes on the wire.
+- *(kp H1)* the status band tags `POWER: NONE — WILL NOT CUT POWER` /
+  `POWER: HALT` (glyph-and-word, not colour) so an armed-but-inert daemon is
+  not indistinguishable from a live one.
+- *(kp H2)* a Settings change that lowers protection while armed
+  (`dry_run = true`, or a non-`poweroff` power action) now routes through a
+  `Modal::ConfirmConfigSet` step; everything else stays one keystroke
+  (`enabling_dry_run_while_armed_asks_to_confirm_first`).
+- *(kp L1)* `swap_config` logs the automatic engage-clear on a target change.
+- *(tui #1)* Ctrl-C → quit from anywhere (quitting never disarms); other
+  Ctrl-/Alt-chords are swallowed, not typed as their bare letter.
+- *(tui #2)* the `DestroyConfirm` step cancels on *any* non-`y` key —
+  arrows, Enter, Esc, Backspace included (handled in `input::intent`).
+- *(tui #3 / cq #6)* multi-line validation reports render as lines on the
+  Settings screen; toasts keep the first line only and scrub control bytes.
+- *(tui #4)* the Settings screen refuses edits while `Conn::Down`, mirroring
+  `open_destroy_fence`.
+- *(tui + cq)* `help_scroll` is clamped to the content length.
+- *(cq #1)* `ui/config.rs` matches the `PowerAction` enum, not its `Display`
+  text, for the "does not cut power" annotation.
+- *(cq #7 nit)* a comment on `format_rfc3339`'s proleptic-year formatting.
+
+**Deliberately NOT done** (non-blocking, reasons hold): `#[non_exhaustive]`
+on `ConfigPayload`/`LuksDestroyInfo`/`StreamEvent` (`cq #5`) — the daemon
+constructs all three directly, so it needs constructors/builders first, a
+wider change than this pass warrants; the `SETTINGS_ROW_COUNT` /
+`edit_setting` / `editable_rows` three-way coupling (`cq #2`) — now partly
+mitigated by the shared `App::setting_change` helper; `MenuItem::ORDER`
+completeness assert (`cq #3`); the render-thread refresh coalescing
+(`cq #4` / `kp M1`) — the `VecDeque<Arc<StreamEvent>>` backlog item is
+already parked for the same reason; the remaining low-severity
+config-origin sanitization sites (`sec #7`, `sec #8` beyond `target_header`,
+`cq #6` toast — `{:?}`-escaped at source, root-owned, not a privilege
+boundary).
+
+**Build/test on this batch: green (2026-09-08).** `cargo fmt --all --check`,
+`cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test
+--workspace` all pass — **245 tests** (37 `killbill-proto` + 58 `killbill-tui`
++ 150 `killbilld`), the 235-test post-`Conn::Down` baseline plus 10 new: 2 in
+`killbilld` (`disarm_clears_the_luks_destroy_engage_toggle`,
+`armed_kill_with_power_none_but_luks_destroy_engaged_does_not_broadcast_would_kill`)
+and 8 in `killbill-tui` (3 `input` — Ctrl-C, fence any-key-cancel; 5 `app` —
+target-change abort, settings-confirm-while-armed ×2, settings-refused-while-
+down, help-scroll clamp). One existing `app` test
+(`destroy_fence_step_two_also_accepts_capital_y`) was rewritten to drive
+through `open_destroy_fence` so it exercises the new target-capture.
+
+**Scoped re-review of the fix batch — both PASS (2026-09-08):**
+
+- `security-auditor` (BLOCK + 4 mediums + sec #6 + the disarm decision):
+  **PASS.** All six items "correctly and completely implemented, each with a
+  regression test that asserts the security-relevant behaviour". Disarm
+  decision "consistent with invariants 4 and 5 and does not touch the kill
+  path". No deps/network/unsafe; `requires_root` still closed.
+  - *Residual Medium, documented not fixed:* the fence↔target binding is
+    client-side only — `Command::SetLuksDestroyEngaged(bool)` carries no
+    target, so the daemon cannot verify which header the operator confirmed.
+    Narrow (needs a concurrent root `reload`/`config set` inside the
+    `call()` window) and inert today (stub + `swap_config` clears on
+    retarget). **Close before the LUKS wipe is ever implemented**, together
+    with the `SetLuksDestroyEngaged` preflight item above: extend the command
+    to `{ engage: bool, target_header: String }` (or a config-generation
+    counter) and refuse a mismatch in `Core::set_luks_destroy_engaged` — that
+    also covers `killbillctl luks engage`, which has no fence at all.
+- `kill-path-reliability` (H1/H2/L1 + disarm + the WouldKill guard):
+  **PASS.** "No kill-path, fail-closed, or invariant-5 regression." Three
+  non-blocking follow-ups it raised were **applied in the same pass**:
+  (1) `ConfigChange::OnSensorGap(Warn)` added to `lowers_protection` +
+  a row-3 confirm string; (2) unknown armed state (`status == None` while
+  `Conn::Up`) now counts as armed for the confirm gate — fail closed
+  (`edit_setting` uses `map_or(true, ..)`; the three status-less Settings
+  tests now set an explicit disarmed status); (3) `POWER: HALT` in the
+  status band spells out `— WILL NOT CUT POWER`, matching `ui/config.rs`.
+  Also: `destroy_target` is now cleared on any modal-replacing global key
+  (`m`/`?`), so the fence's captured target can't outlive its modal; the
+  disarm test asserts the `ConfigChanged` broadcast reaches a subscriber.
+
+**Still owed at step 13:** a full-tree `code-quality` + `tui-ux` +
+`security-auditor` + `kill-path-reliability` sign-off (the scoped passes
+above cover only the fix batch, not steps 4–12 as a whole).
+
+After the `Conn::Down` fix + `cargo fmt --all`: `cargo fmt --all --check`,
+`cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test
+--workspace` are all green — 235 tests (37 `killbill-proto` + 50 `killbill-tui`
++ 148 `killbilld`), the 2 new being `destroy_fence_refuses_while_the_daemon_is_unreachable`
+and `state_line_hides_the_cached_engaged_value_while_the_daemon_is_down`. The
+step 11–12 screen files needed `cargo fmt` applied (they never had been); that
+run also reflowed the new `.title(screen_title(...))` call sites.
+
+- **Step 7** — `Modal::Confirm { action: ConfirmAction }` (`Arm` / `Disarm` /
+  `Reload`). The three menu items open a confirm modal instead of calling
+  `command()` directly; `Enter` fires, `Esc` cancels with no command sent
+  (invariant 5 is unaffected either way — disarm was already socket-only, this
+  just adds a keystroke of intent). Menu also now greys `LUKS destroy` when a
+  loaded `ConfigPayload` has `luks_destroy: None`.
+- **Step 8** — `Screen::Whitelist`: full list from `WhitelistList` including
+  entries whose device is absent, each marked connected/absent by cross-ref
+  against `devices`. Row 0 is a permanent "+ Add entry" action (no key
+  collision with the `a`=arm accelerator the design reserves). Add is
+  type-an-id (`Modal::WhitelistAddId`, hex+colon only, parsed by
+  `UsbId::from_str` — a bad id keeps the field open, fails loud) → count
+  stepper. Edit reuses the stepper (`Modal::WhitelistCount { editing: true }`)
+  and preserves the existing `label` on the upsert. Remove is a confirm
+  (`Modal::WhitelistRemoveEntry`). Every confirm re-reads the entry by index
+  and reports (not panics) if it vanished. `WhitelistChanged` now also
+  re-fetches the whitelist and status, not just devices.
+- **Step 9** — `Screen::Settings`: `GetConfig` snapshot; `Enter` on a row
+  toggles `dry_run` / `armed_at_boot` or cycles `power_action`
+  (poweroff→halt→none) / `on_sensor_gap` (warn↔kill) via `ConfigSet`. A
+  rejected `ConfigSet` shows the daemon's full validation report verbatim in
+  `Modal::Report` and re-fetches `GetConfig`, so the screen always reflects
+  the still-running config (invariant 2 — nothing was written or swapped).
+  `sensors` and `luks_destroy` are shown read-only (edited via `killbillctl`
+  in v1 — no free-text list editor).
+- **Step 10** — `Screen::DryRun`: runs one `RunDryRun` on entry and on `r`,
+  renders `Reply::DryRun` as one line per `KillReason` or a clear "nothing
+  would fire"; read-only, never dispatches. `Screen::EventLog`: a capped
+  1000-entry `VecDeque<StreamEvent>` ring appended in `on_event` for *every*
+  event, rendered newest-last with the daemon's `se.at` timestamp; `↑`/`↓`
+  scroll, `p` freezes auto-follow. No filter yet (design §5's `/` — deferred).
+- **Step 11** — `Screen::Config` (`ui/config.rs`): read-only dump of the whole
+  running `ConfigPayload` — every field Settings edits plus `sensors`,
+  `luks_destroy` (target sanitized, `acknowledged`, `engaged`), and the full
+  `validation_error` report inline with a red banner when the file on disk is
+  broken (invariant 2). `halt`/`none` power actions are flagged "does not cut
+  power". `Screen::Help` (`ui/help.rs`): a static key/menu reference built from
+  `const SECTIONS`, hand-kept in step with `input::intent` (a key here and not
+  there, or vice versa, is the bug it exists to catch); `↑`/`↓` scroll via a
+  `help_scroll: u16` Paragraph offset. Both are plain menu targets, no new
+  protocol.
+- **Step 12** — `Screen::Destroy` (`ui/destroy.rs`): the fenced screen. Double
+  hazard border in `theme.invalid()`, names the sanitized `target_header`,
+  shows `acknowledged` + a big colour-**and**-word `engaged` state, and says
+  in plain text three times over that the wipe is a v1 stub (invariant 3) —
+  engaging changes nothing destructive today. `Enter` opens a two-step fence:
+  `Modal::DestroyText { engage }` captures a letters-only field that must equal
+  exactly `DESTROY` (`DESTROY_WORD`, case-sensitive — `input_char` does not
+  fold case for this modal), then `Modal::DestroyConfirm { engage }` takes a
+  final `y`/`Y`; **any** other key, `Enter`, or `Esc` at either step cancels
+  with nothing sent. Only on `y` does `SetLuksDestroyEngaged(engage)` go out,
+  followed by a `GetConfig` + `GetStatus` re-fetch. `engage` is always derived
+  from the *current* `engaged` state (`app.luks_engaged()` reads the config
+  cache, `false` when unknown) so the one row toggles both directions. The
+  engaged state is also surfaced outside this screen: the status band shows a
+  red `LUKS DESTROY ENGAGED` tag and the menu item gets a red `(ENGAGED)`
+  suffix (invariant 4 — the dangerous state is visible everywhere, not just on
+  its own screen). No kill-path code touched — this only sets a flag the
+  daemon already had; the wipe stub is unchanged.
+- Known gap carried in from step 4 — **now fixed** (2026-09-08): the read
+  screens (Devices, Whitelist, Config, Dry-run, Event log, Settings, Destroy)
+  render during `Conn::Down` with a ` — STALE (daemon unreachable)` tag in the
+  border title (`ui::screen_title`), on top of the existing status band + the
+  centred "daemon unreachable" box. The Destroy screen — the sharpest case —
+  additionally replaces the cached engaged-state line with `?? ENGAGED STATE
+  UNKNOWN` (`destroy::state_line`) rather than a stale `not engaged`, drops the
+  "press Enter to ENGAGE" hint, and `App::open_destroy_fence` refuses outright
+  while `Conn::Down`. The main menu's `(ENGAGED)` marker (which can overhang the
+  centred box) becomes `(engaged? — daemon unreachable)` in `warn` not the
+  reversed-red `invalid()`. Help is untouched (fully static, nothing to go
+  stale).
+  Covered by `destroy_fence_refuses_while_the_daemon_is_unreachable` (app.rs)
+  and `state_line_hides_the_cached_engaged_value_while_the_daemon_is_down`
+  (ui/destroy.rs). Still not re-reviewed — part of the pending steps 4–12 gate.
+- Not built: the design-doc device-action "View raw uevent" option (no
+  raw-uevent data on `DeviceInfo` — out of protocol scope), the Event-log `/`
+  filter (design §5 — deferred), and any Config-screen copy-path affordance.
 
 Cargo workspace:
 
@@ -250,13 +714,22 @@ Cargo workspace:
   **every** sensor variant, not just device events: a queued `SensorRestarting`
   or `SensorEnded` is a gap, and a signal must never be a way to skip a pending
   kill (invariant 5).
+  **Phase 2 step 2** added handlers for `GetConfig`/`ConfigSet`/
+  `SetLuksDestroyEngaged`, the event backlog, and the broadcasts described in
+  the Phase 2 status block above — all still on the one authority thread, none
+  of it touching the kill path itself.
 - `killbilld` bin — `main.rs`: two flags (`--config`, `--socket`), a
   `tracing-appender` non-blocking stderr sink, hand off to `daemon::run`.
 - `killbillctl` (step 7) — `clap` subcommands (`status`, `devices`, `arm`,
   `disarm`, `test`, `reload`, `whitelist list|add|remove`, `events`); a pure
   protocol client over the SEQPACKET socket. `#![forbid(unsafe_code)]`.
-- Protocol additions (all additive to `#[non_exhaustive]` types, charter §8
-  updated): `Command::WhitelistList`, `Reply::Whitelist`, `Reply::DryRun`,
+  **Phase 2 step 3** added `config show|set`, `luks engage`, and `--follow` on
+  `events` — see the Phase 2 status block above.
+- Protocol additions from Phase 1 (all additive to `#[non_exhaustive]` types,
+  charter §8 updated; Phase 2 step 1's additions — `OnSensorGap`,
+  `ConfigPayload`, `ConfigChange`, `StreamEvent`, `GetConfig`, `ConfigSet`,
+  `SetLuksDestroyEngaged` — are in the Phase 2 status block above rather than
+  repeated here): `Command::WhitelistList`, `Reply::Whitelist`, `Reply::DryRun`,
   `Event::SensorStopped`, `Event::EventsLost`, `StatusPayload.sensor_ok` +
   `StatusPayload.events_lost` (both `#[serde(default)]`), `KillReason::SensorGap`,
   `sanitize_device_string` (one shared copy for every wire end; also applied in

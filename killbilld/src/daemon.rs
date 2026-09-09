@@ -41,6 +41,7 @@
 //! * A kill in flight at shutdown → the process parks and never exits; the
 //!   machine is going down (invariant 5, [`kill_in_flight`]).
 
+use std::collections::VecDeque;
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
@@ -50,13 +51,14 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use killbill_proto::{
-    Action, Command, DeviceIdentity, DeviceInfo, Event, EventKind, KillReason, Reply, SensorEvent,
-    SensorSource, StatusPayload, UsbId, WhitelistEntry,
+    rfc3339_now, Action, Command, ConfigChange, ConfigPayload, DeviceIdentity, DeviceInfo, Event,
+    EventKind, KillReason, LuksDestroyInfo, OnSensorGap, PowerAction, Reply, SensorEvent,
+    SensorSource, StatusPayload, StreamEvent, UsbId, WhitelistEntry,
 };
 
 use crate::config::{self, Config, RawConfig, RawWhitelistEntry, SensorGapAction, SensorName};
 use crate::config_store;
-use crate::control::{self, ControlRequest, PeerCred};
+use crate::control::{self, ControlRequest, PeerCred, SubscribeOutcome};
 use crate::device_table::DeviceTable;
 use crate::policy::{self, Decision};
 use crate::responder::{self, build_responders, dispatch, kill_failed, kill_in_flight, Responder};
@@ -623,9 +625,14 @@ fn spawn_signal_thread(msg_tx: Sender<Msg>) -> anyhow::Result<()> {
 /// A subscribed control connection's event channel, plus a miss counter so a
 /// client that stops reading is eventually dropped rather than leaking a thread.
 struct Subscriber {
-    tx: SyncSender<Event>,
+    tx: SyncSender<StreamEvent>,
     consecutive_misses: u32,
 }
+
+/// Cap on the event backlog replayed to a new subscriber. Generous for a UI
+/// that reconnects promptly; a long-disconnected client just starts from
+/// "now" like it always could.
+const EVENT_BACKLOG_CAP: usize = 200;
 
 /// All the daemon's mutable state. Touched only by the core loop.
 struct Core {
@@ -639,8 +646,20 @@ struct Core {
     devices: DeviceTracker,
     responders: Vec<Arc<dyn Responder>>,
     subscribers: Vec<Subscriber>,
+    /// The last [`EVENT_BACKLOG_CAP`] broadcast events, oldest first — replayed
+    /// to a new subscriber by the connection thread (see
+    /// [`crate::control::serve_subscription`]), never by this one.
+    event_backlog: VecDeque<StreamEvent>,
     sensor_ok: bool,
     events_lost: bool,
+    /// The runtime twin of `config.luks_destroy`'s config-time acknowledgment
+    /// (invariant 4: two distinctly-named opt-ins, neither sufficient alone —
+    /// see `policy::act`). Set only by `Command::SetLuksDestroyEngaged`, and
+    /// **never persisted**: every daemon start begins `false`, and any config
+    /// swap that drops or de-acknowledges `luks_destroy` clears it too (see
+    /// `swap_config`) — an engaged flag must not silently outlive the target
+    /// it was engaged for.
+    luks_destroy_engaged: bool,
     /// A sensor-gap kill has been dispatched under `on_sensor_gap = "kill"`.
     /// Latches [`Core::maybe_dispatch_gap_kill`] against a gap-notification
     /// burst; cleared on any config swap so a post-gap `reload` re-enables it.
@@ -687,10 +706,14 @@ impl Core {
             devices: DeviceTracker::default(),
             responders,
             subscribers: Vec::new(),
+            event_backlog: VecDeque::with_capacity(EVENT_BACKLOG_CAP),
             // Optimism is not allowed here (invariant 2): the sensor is "not ok"
             // until it has told us its socket opened (`Msg::SensorStarted`).
             sensor_ok: false,
             events_lost: false,
+            // Never persisted, never inherited from a prior run — see the
+            // field's doc comment.
+            luks_destroy_engaged: false,
             gap_kill_dispatched: false,
             config_stale: false,
             boot_arm_pending: false,
@@ -723,7 +746,12 @@ impl Core {
 
         // Decide against the table as it was *before* this event (the policy.rs
         // contract).
-        let decision = policy::decide(&event, &self.config, &self.devices.table);
+        let decision = policy::decide(
+            &event,
+            &self.config,
+            &self.devices.table,
+            self.luks_destroy_engaged,
+        );
 
         // KILL PATH: if armed, the decision is to act, and this is a real
         // (non-synthetic) event, dispatch *now*. The Action is never queued.
@@ -758,17 +786,41 @@ impl Core {
                 id = ?event.identity.usb_id,
                 "device event — allowed"
             ),
-            Decision::Act(action) if acting => tracing::warn!(
-                reason = %action.reason,
-                power = %action.power,
-                dry_run = action.dry_run,
-                luks_destroy = action.luks_destroy,
-                // A synthetic `remove` (e.g. `udevadm trigger --action=remove`)
-                // fires like a real unplug — the log must let them be told
-                // apart after the fact.
-                synthetic_uevent = event.raw.contains_key("SYNTH_UUID"),
-                "UNAUTHORIZED USB EVENT — kill action dispatched to all responders"
-            ),
+            Decision::Act(action) if acting => {
+                // The responders run for real here, but two of them are
+                // effectively silent to a subscriber: `dry_run` makes every
+                // responder log-only (invariant 1's "dry_run" contract), and
+                // `power_action = "none"` makes the poweroff responder itself
+                // a no-op even outside dry-run — both are documented safety
+                // belts (the hardware-gate protocol tests every substep with
+                // both engaged) and both leave nothing for the machine to
+                // visibly do. Without this, a client watching either belt
+                // sees the device appear and then silence. `run_dry_run`'s
+                // manual `WouldKill` broadcast is the other half of this;
+                // this is the automatic-on-every-event half.
+                //
+                // `power = "none"` only counts as "hypothetical" when nothing
+                // else on the Action actually acts: with `luks_destroy` engaged
+                // the LUKS responder still receives a real `luks_destroy: true`
+                // (a stub today, invariant 3 — but this broadcast must not grow
+                // into announcing "would kill" while a real header wipe runs).
+                let would_only_log =
+                    action.dry_run || (action.power == PowerAction::None && !action.luks_destroy);
+                if would_only_log {
+                    self.broadcast(Event::WouldKill(action.reason.clone()));
+                }
+                tracing::warn!(
+                    reason = %action.reason,
+                    power = %action.power,
+                    dry_run = action.dry_run,
+                    luks_destroy = action.luks_destroy,
+                    // A synthetic `remove` (e.g. `udevadm trigger --action=remove`)
+                    // fires like a real unplug — the log must let them be told
+                    // apart after the fact.
+                    synthetic_uevent = event.raw.contains_key("SYNTH_UUID"),
+                    "UNAUTHORIZED USB EVENT — kill action dispatched to all responders"
+                );
+            }
             Decision::Act(action) if synthetic => tracing::info!(
                 reason = %action.reason,
                 "policy would fire for a device announced by a synthetic uevent (already \
@@ -975,6 +1027,11 @@ impl Core {
             Command::WhitelistAdd(entry) => self.whitelist_add(entry, reply),
             Command::WhitelistRemove(id) => self.whitelist_remove(id, reply),
             Command::ReloadConfig => self.reload(reply),
+            Command::GetConfig => answer(reply, Reply::Config(self.config_payload())),
+            Command::ConfigSet(change) => self.config_set(change, peer, reply),
+            Command::SetLuksDestroyEngaged(want) => {
+                self.set_luks_destroy_engaged(want, peer, reply)
+            }
             Command::Subscribe => answer(
                 reply,
                 Reply::Error(
@@ -985,7 +1042,12 @@ impl Core {
         }
     }
 
-    fn subscribe(&mut self, peer: PeerCred, tx: SyncSender<Event>, ack: SyncSender<Reply>) {
+    fn subscribe(
+        &mut self,
+        peer: PeerCred,
+        tx: SyncSender<StreamEvent>,
+        ack: SyncSender<SubscribeOutcome>,
+    ) {
         // The event stream carries device ids, serials, and arm/disarm/would-kill
         // transitions — more than `status`. Require uid 0, like the state-
         // changing commands (the connection thread checks this too).
@@ -995,7 +1057,7 @@ impl Core {
                 peer_pid = peer.pid,
                 "denied an event subscription from a non-root peer"
             );
-            answer(
+            answer_subscribe(
                 ack,
                 Reply::Error(format!(
                     "permission denied: the event stream requires uid 0 (peer uid {})",
@@ -1009,17 +1071,24 @@ impl Core {
                 limit = Self::MAX_SUBSCRIBERS,
                 "refusing an event subscriber — already at the limit"
             );
-            answer(
+            answer_subscribe(
                 ack,
                 Reply::Error("too many event subscribers; try again shortly".to_owned()),
             );
             return;
         }
+        // Snapshot the backlog before pushing the new subscriber — not that
+        // ordering matters on a single-threaded core, but it reads as the
+        // obviously-correct order: "what happened before you joined".
+        let backlog: Vec<StreamEvent> = self.event_backlog.iter().cloned().collect();
         self.subscribers.push(Subscriber {
             tx,
             consecutive_misses: 0,
         });
-        answer(ack, Reply::Ok);
+        let _ = ack.try_send(SubscribeOutcome {
+            reply: Reply::Ok,
+            backlog,
+        });
     }
 
     fn status(&self) -> StatusPayload {
@@ -1033,6 +1102,37 @@ impl Core {
             sensor_ok: self.sensor_ok,
             events_lost: self.events_lost,
             config_stale: self.config_stale,
+        }
+    }
+
+    /// A snapshot of the **running** (validated) config, answering
+    /// `Command::GetConfig`. See [`ConfigPayload`]'s doc comment for why this
+    /// is the last-good config rather than a reflection of a broken file.
+    fn config_payload(&self) -> ConfigPayload {
+        ConfigPayload {
+            armed_at_boot: self.config.armed_at_boot,
+            sensors: self
+                .config
+                .sensors
+                .iter()
+                .map(|s| match s {
+                    SensorName::Usb => "usb".to_owned(),
+                })
+                .collect(),
+            dry_run: self.config.dry_run,
+            power_action: self.config.power_action,
+            on_sensor_gap: match self.config.on_sensor_gap {
+                SensorGapAction::Warn => OnSensorGap::Warn,
+                SensorGapAction::Kill => OnSensorGap::Kill,
+            },
+            luks_destroy: self.config.luks_destroy.as_ref().map(|l| LuksDestroyInfo {
+                // Always true here — see `LuksDestroyInfo::acknowledged`'s doc
+                // comment for why `validate` guarantees it.
+                acknowledged: true,
+                target_header: l.target_header.display().to_string(),
+                engaged: self.luks_destroy_engaged,
+            }),
+            validation_error: self.config_error.clone(),
         }
     }
 
@@ -1111,6 +1211,20 @@ impl Core {
             self.armed = false;
             tracing::warn!(peer_uid = peer.uid, peer_pid = peer.pid, "DISARMED");
             self.broadcast(Event::Disarmed);
+            // The destructive opt-in is scoped to a single armed session
+            // (decision recorded in CLAUDE.md, 2026-09-08): a disarm clears the
+            // runtime engage toggle, so re-engaging always means the operator
+            // walks the typed-`DESTROY` fence again. Already cleared on daemon
+            // restart and on a config target change — this adds disarm.
+            if self.luks_destroy_engaged {
+                self.luks_destroy_engaged = false;
+                tracing::warn!(
+                    peer_uid = peer.uid,
+                    peer_pid = peer.pid,
+                    "cleared LUKS header destruction engage toggle on disarm"
+                );
+                self.broadcast(Event::ConfigChanged);
+            }
         } else {
             tracing::info!(
                 peer_uid = peer.uid,
@@ -1149,6 +1263,99 @@ impl Core {
         let mut raw = self.raw.clone();
         raw.whitelist.retain(|w| w.id != id);
         self.begin_apply(raw, "whitelist remove", reply);
+    }
+
+    /// Apply one [`ConfigChange`] to a clone of the raw config and validate the
+    /// whole thing (invariant 2) — exactly [`Core::whitelist_add`]'s shape,
+    /// just touching a different field. `label` is used only for logging and
+    /// to pick the right broadcast event in [`Core::swap_config`].
+    fn config_set(&mut self, change: ConfigChange, peer: PeerCred, reply: SyncSender<Reply>) {
+        if let Some(guard) = self.config_change_refusal("config set") {
+            answer(reply, guard);
+            return;
+        }
+        // Audit trail: a config change alters how the daemon responds to a kill;
+        // record who asked, the same as `arm`/`disarm` do.
+        tracing::info!(
+            peer_uid = peer.uid,
+            peer_pid = peer.pid,
+            change = ?change,
+            "config set requested"
+        );
+        let mut raw = self.raw.clone();
+        let label: &'static str = match change {
+            ConfigChange::DryRun(v) => {
+                raw.response.dry_run = v;
+                "config set dry_run"
+            }
+            ConfigChange::PowerAction(pa) => {
+                raw.response.power_action = Some(pa.to_string());
+                "config set power_action"
+            }
+            ConfigChange::ArmedAtBoot(v) => {
+                raw.general.armed_at_boot = v;
+                "config set armed_at_boot"
+            }
+            ConfigChange::Sensors(names) => {
+                raw.detection.sensors = names;
+                "config set sensors"
+            }
+            ConfigChange::OnSensorGap(gap) => {
+                raw.response.on_sensor_gap = Some(gap.to_string());
+                "config set on_sensor_gap"
+            }
+            // `ConfigChange` is `#[non_exhaustive]` from this crate's side —
+            // a future variant added to `killbill-proto` without a matching
+            // arm here must fail closed (invariant 2), not panic on the
+            // authority thread. Same shape as `on_command`'s catch-all.
+            _ => {
+                answer(reply, Reply::Error("unrecognized config field".to_owned()));
+                return;
+            }
+        };
+        self.begin_apply(raw, label, reply);
+    }
+
+    /// `Command::SetLuksDestroyEngaged` — the runtime half of invariant 4's
+    /// two-opt-in requirement (see `policy::act` and the `luks_destroy_engaged`
+    /// field doc comment). Never touches the config file: this is `Core`
+    /// state, not persisted, so it never goes through `begin_apply`/the
+    /// writer thread.
+    fn set_luks_destroy_engaged(&mut self, want: bool, peer: PeerCred, reply: SyncSender<Reply>) {
+        if want && self.config.luks_destroy.is_none() {
+            answer(
+                reply,
+                Reply::Error(
+                    "refusing to engage LUKS header destruction: [response.luks_destroy] is not \
+                     configured and acknowledged in the running config"
+                        .to_owned(),
+                ),
+            );
+            return;
+        }
+        // Log every accepted request, not just ones that actually flip the
+        // value: a repeated `SetLuksDestroyEngaged(true)` is an operator
+        // re-confirming a dangerous state, and the audit trail for a
+        // destructive opt-in (invariant 4) should show every confirmation,
+        // not only the first.
+        let changed = self.luks_destroy_engaged != want;
+        self.luks_destroy_engaged = want;
+        tracing::warn!(
+            engaged = want,
+            changed,
+            peer_uid = peer.uid,
+            peer_pid = peer.pid,
+            "LUKS header destruction runtime engage toggle set"
+        );
+        // Tell every other subscriber (a second TUI, `killbillctl events
+        // --follow`) that a dangerous runtime state changed — it is surfaced
+        // through `ConfigPayload::luks_destroy.engaged`, so `ConfigChanged` is
+        // the "re-fetch GetConfig" signal for it (invariant 4: the engaged
+        // state must be visible everywhere, not only to the client that set it).
+        if changed {
+            self.broadcast(Event::ConfigChanged);
+        }
+        answer(reply, Reply::Ok);
     }
 
     /// `Some(reason)` if a config-mutating command must be refused right now.
@@ -1276,12 +1483,9 @@ impl Core {
                     "reload REJECTED — the config file could not be read; running config and \
                      armed state kept (invariant 2), on-disk file differs and needs fixing"
                 );
-                answer(
-                    reply,
-                    Reply::Error(format!(
-                        "reload failed — the config file could not be read: {e}"
-                    )),
-                );
+                let reason = format!("reload failed — the config file could not be read: {e}");
+                self.broadcast(Event::ReloadFailed(truncate_for_broadcast(&reason)));
+                answer(reply, Reply::Error(reason));
                 return;
             }
         };
@@ -1294,13 +1498,12 @@ impl Core {
                     "reload REJECTED — the config on disk is invalid; running config and armed \
                      state kept (invariant 2), on-disk file differs and needs fixing"
                 );
-                answer(
-                    reply,
-                    Reply::Error(format!(
-                        "reload failed — the config on disk is invalid; keeping the running \
-                         config and armed state (invariant 2):\n{report}"
-                    )),
+                let reason = format!(
+                    "reload failed — the config on disk is invalid; keeping the running config \
+                     and armed state (invariant 2):\n{report}"
                 );
+                self.broadcast(Event::ReloadFailed(truncate_for_broadcast(&reason)));
+                answer(reply, Reply::Error(reason));
                 return;
             }
         };
@@ -1314,13 +1517,12 @@ impl Core {
                     "reload REJECTED while armed — a responder would no longer be able to act; \
                      running config kept, on-disk file differs"
                 );
-                answer(
-                    reply,
-                    Reply::Error(format!(
-                        "reload rejected — while armed, a responder would no longer be able to \
-                         act: {detail}"
-                    )),
+                let reason = format!(
+                    "reload rejected — while armed, a responder would no longer be able to act: \
+                     {detail}"
                 );
+                self.broadcast(Event::ReloadFailed(truncate_for_broadcast(&reason)));
+                answer(reply, Reply::Error(reason));
                 return;
             }
         }
@@ -1334,6 +1536,13 @@ impl Core {
         let was_armed = self.armed;
         let prev_dry_run = self.config.dry_run;
         let prev_power = self.config.power_action;
+        // Captured *before* the swap below overwrites `self.config` — see the
+        // engage-toggle clearing logic just after it.
+        let prev_target = self
+            .config
+            .luks_destroy
+            .as_ref()
+            .map(|l| l.target_header.clone());
 
         self.raw = raw;
         self.config = config;
@@ -1344,9 +1553,44 @@ impl Core {
         // (e.g. `dry_run` just turned off, or `warn` → `kill`). `events_lost`
         // stays sticky — this does not let the daemon re-arm.
         self.gap_kill_dispatched = false;
+        // The runtime engage toggle must not silently outlive the target it
+        // was engaged for (see the field's doc comment). Clearing only when
+        // `luks_destroy` disappears entirely is not enough: a config change
+        // that keeps `luks_destroy` present but repoints `target_header` at a
+        // *different* device is functionally a brand-new, unconfirmed
+        // destructive target, and an old engagement must not carry over to
+        // it — the operator confirmed the old header, not this one. So the
+        // toggle survives a swap only if the target is unchanged.
+        let same_target = matches!(
+            (&prev_target, self.config.luks_destroy.as_ref()),
+            (Some(prev), Some(new)) if *prev == new.target_header
+        );
+        if !same_target {
+            // Log the automatic clear so the audit trail is symmetric with the
+            // explicit engage (which always logs) — a destructive opt-in going
+            // away silently is the asymmetry the review gate flagged.
+            if self.luks_destroy_engaged {
+                tracing::warn!(
+                    change = label,
+                    prev_target = ?prev_target,
+                    "cleared LUKS header destruction engage toggle — target changed"
+                );
+            }
+            self.luks_destroy_engaged = false;
+        }
         self.responders = build_responders(&self.config);
 
         tracing::info!(change = label, "configuration updated");
+
+        // `label` is one of a handful of `&'static str`s this module itself
+        // hands `swap_config` — never client-supplied — so matching on its
+        // text to pick the event is safe and simpler than threading a
+        // dedicated enum through `WriteJob`/`Msg` for the same information.
+        if label.starts_with("whitelist") {
+            self.broadcast(Event::WhitelistChanged);
+        } else {
+            self.broadcast(Event::ConfigChanged);
+        }
 
         if was_armed {
             if self.config.dry_run && !prev_dry_run {
@@ -1385,7 +1629,9 @@ impl Core {
                 identity: identity.clone(),
                 raw: Default::default(),
             };
-            if let Decision::Act(action) = policy::decide(&synthetic, &self.config, &others) {
+            let decision =
+                policy::decide(&synthetic, &self.config, &others, self.luks_destroy_engaged);
+            if let Decision::Act(action) = decision {
                 reasons.push(action.reason);
             }
         }
@@ -1433,9 +1679,24 @@ impl Core {
             .collect()
     }
 
+    /// Stamp `event` as a [`StreamEvent`], append it to the backlog (capped at
+    /// [`EVENT_BACKLOG_CAP`]), and push it to every live subscriber. The
+    /// timestamp is generated exactly once here, so the copy a new subscriber
+    /// gets from the backlog and the copy an already-subscribed client got
+    /// live are identical — never two different stamps for the same event.
     fn broadcast(&mut self, event: Event) {
+        let stream_event = StreamEvent {
+            at: rfc3339_now(),
+            event,
+        };
+
+        if self.event_backlog.len() >= EVENT_BACKLOG_CAP {
+            self.event_backlog.pop_front();
+        }
+        self.event_backlog.push_back(stream_event.clone());
+
         self.subscribers
-            .retain_mut(|sub| match sub.tx.try_send(event.clone()) {
+            .retain_mut(|sub| match sub.tx.try_send(stream_event.clone()) {
                 Ok(()) => {
                     sub.consecutive_misses = 0;
                     true
@@ -1458,6 +1719,15 @@ fn answer(reply: SyncSender<Reply>, r: Reply) {
     let _ = reply.try_send(r);
 }
 
+/// Like [`answer`], for a refused subscription — the backlog is always empty
+/// on refusal (nothing is ever handed to a caller that was denied it).
+fn answer_subscribe(ack: SyncSender<SubscribeOutcome>, reply: Reply) {
+    let _ = ack.try_send(SubscribeOutcome {
+        reply,
+        backlog: Vec::new(),
+    });
+}
+
 fn command_name(cmd: &Command) -> &'static str {
     match cmd {
         Command::GetStatus => "status",
@@ -1469,6 +1739,9 @@ fn command_name(cmd: &Command) -> &'static str {
         Command::WhitelistList => "whitelist-list",
         Command::RunDryRun => "dry-run",
         Command::ReloadConfig => "reload",
+        Command::GetConfig => "get-config",
+        Command::ConfigSet(_) => "config-set",
+        Command::SetLuksDestroyEngaged(_) => "set-luks-destroy-engaged",
         Command::Subscribe => "subscribe",
         _ => "unknown",
     }
@@ -1480,6 +1753,49 @@ fn join_failures(failures: &[responder::ResponderNotReady]) -> String {
         .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join("; ")
+}
+
+/// Cap on a `String` this module puts into a broadcast [`Event`] (currently
+/// just `Event::ReloadFailed`'s reason). A [`config::ValidationReport`]
+/// collects *every* problem in the file — unbounded in principle, e.g. a
+/// config with hundreds of malformed whitelist entries — so without this a
+/// single broadcast can exceed `MAX_CONTROL_FRAME` on its own. `encode`
+/// rejects an oversized frame with `ProtocolError::FrameTooLarge`, and unlike
+/// a direct command reply (which `control::serve_connection` already turns
+/// into a small "too large" error) an unsendable *broadcast* event has
+/// nowhere else to go: it would sit in `event_backlog` and break replay for
+/// every subscriber after it, not just this one. So truncate at the source
+/// instead of relying on every write site downstream. The caller who asked
+/// for the reload directly still gets the full, untruncated report in their
+/// own `Reply::Error`; the daemon's log always has the full report too — only
+/// the broadcast copy is capped.
+const MAX_BROADCAST_REASON_LEN: usize = 4096;
+
+fn truncate_for_broadcast(reason: &str) -> String {
+    // Scrub C0/C1 control characters (keeping `\n` and `\t`) before this reaches
+    // every subscriber's terminal. A `ValidationReport` is already escape-safe —
+    // every `ConfigError` field is formatted with `{:?}` — but a TOML parse
+    // error echoes a raw source line, and that is the one broadcast string that
+    // could carry a stray control byte from the root-owned config file.
+    let scrubbed: String = reason
+        .chars()
+        .map(|c| match c {
+            '\n' | '\t' => c,
+            c if c.is_control() => '\u{fffd}',
+            c => c,
+        })
+        .collect();
+    if scrubbed.len() <= MAX_BROADCAST_REASON_LEN {
+        return scrubbed;
+    }
+    let mut cut = MAX_BROADCAST_REASON_LEN;
+    while !scrubbed.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!(
+        "{}… (truncated; see the daemon log or run `reload` directly for the full report)",
+        &scrubbed[..cut]
+    )
 }
 
 fn default_config() -> Config {
@@ -1520,7 +1836,6 @@ impl DeviceTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use killbill_proto::PowerAction;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::mpsc::sync_channel;
     use std::sync::Mutex;
@@ -1570,11 +1885,24 @@ mod tests {
             }
         }
 
-        /// Subscribe on behalf of `peer`, returning the synchronous ack.
-        fn subscribe(&mut self, peer: PeerCred, tx: SyncSender<Event>) -> Reply {
-            let (ack, ack_rx) = sync_channel::<Reply>(1);
+        /// Subscribe on behalf of `peer`, returning the synchronous ack (the
+        /// backlog, if accepted, is discarded — see [`Self::subscribe_full`]
+        /// for the tests that care about it).
+        fn subscribe(&mut self, peer: PeerCred, tx: SyncSender<StreamEvent>) -> Reply {
+            self.subscribe_full(peer, tx).0
+        }
+
+        /// Subscribe on behalf of `peer`, returning both the ack and the
+        /// backlog it was handed.
+        fn subscribe_full(
+            &mut self,
+            peer: PeerCred,
+            tx: SyncSender<StreamEvent>,
+        ) -> (Reply, Vec<StreamEvent>) {
+            let (ack, ack_rx) = sync_channel::<SubscribeOutcome>(1);
             self.core.subscribe(peer, tx, ack);
-            ack_rx.try_recv().expect("subscribe answers synchronously")
+            let outcome = ack_rx.try_recv().expect("subscribe answers synchronously");
+            (outcome.reply, outcome.backlog)
         }
 
         /// Run one pending writer job synchronously, as the writer thread would,
@@ -1697,16 +2025,16 @@ mod tests {
         h.core.config.sensors.clear();
         h.core.responders.clear();
 
-        let (tx, rx) = sync_channel::<Event>(4);
+        let (tx, rx) = sync_channel::<StreamEvent>(4);
         assert!(matches!(h.subscribe(root(), tx), Reply::Ok));
 
         assert!(h.core.arm(root()).is_ok());
         assert!(h.core.armed);
-        assert!(matches!(rx.try_recv().unwrap(), Event::Armed));
+        assert!(matches!(rx.try_recv().unwrap().event, Event::Armed));
 
         h.core.disarm(root());
         assert!(!h.core.armed);
-        assert!(matches!(rx.try_recv().unwrap(), Event::Disarmed));
+        assert!(matches!(rx.try_recv().unwrap().event, Event::Disarmed));
     }
 
     #[test]
@@ -1761,7 +2089,7 @@ mod tests {
     #[test]
     fn a_non_root_peer_cannot_subscribe() {
         let mut h = Harness::new("");
-        let (tx, _rx) = sync_channel::<Event>(4);
+        let (tx, _rx) = sync_channel::<StreamEvent>(4);
         assert!(matches!(h.subscribe(mallory(), tx), Reply::Error(_)));
         assert!(h.core.subscribers.is_empty());
     }
@@ -1805,6 +2133,423 @@ mod tests {
         let (wt, _) = mpsc::channel();
         let reloaded = Core::load(&h.path, wt);
         assert_eq!(reloaded.config.whitelist.len(), 1);
+    }
+
+    #[test]
+    fn get_config_reflects_the_running_config() {
+        let h = Harness::new(
+            "[general]\narmed_at_boot = true\n[response]\ndry_run = true\n\
+             power_action = \"halt\"\non_sensor_gap = \"kill\"\n",
+        );
+        let payload = h.core.config_payload();
+        assert!(payload.armed_at_boot);
+        assert_eq!(payload.sensors, vec!["usb".to_owned()]);
+        assert!(payload.dry_run);
+        assert_eq!(payload.power_action, PowerAction::Halt);
+        assert_eq!(payload.on_sensor_gap, killbill_proto::OnSensorGap::Kill);
+        assert!(payload.luks_destroy.is_none());
+        assert!(payload.validation_error.is_none());
+    }
+
+    #[test]
+    fn get_config_surfaces_the_validation_error_and_falls_back_to_defaults() {
+        let h = Harness::new("[response]\npower_action = \"explode\"\n");
+        assert!(h.core.config_error.is_some());
+        let payload = h.core.config_payload();
+        assert!(payload.validation_error.is_some());
+        // Falls back to the always-valid default, not a half-parsed guess
+        // (invariant 2) — never a reflection of the broken file.
+        assert_eq!(payload.power_action, PowerAction::PowerOff);
+    }
+
+    #[test]
+    fn whitelist_add_broadcasts_whitelist_changed_not_config_changed() {
+        let mut h = Harness::new("");
+        let (etx, erx) = sync_channel::<StreamEvent>(4);
+        assert!(matches!(h.subscribe(root(), etx), Reply::Ok));
+
+        let (tx, rx) = sync_channel::<Reply>(1);
+        h.core.whitelist_add(
+            WhitelistEntry {
+                id: UsbId::new(0x1050, 0x0407),
+                label: None,
+                max_count: None,
+            },
+            tx,
+        );
+        h.pump_writer();
+        assert!(matches!(rx.try_recv().unwrap(), Reply::Ok));
+
+        assert!(matches!(
+            erx.try_recv().unwrap().event,
+            Event::WhitelistChanged
+        ));
+    }
+
+    #[test]
+    fn config_set_dry_run_persists_and_broadcasts_config_changed() {
+        let mut h = Harness::new("");
+        let (etx, erx) = sync_channel::<StreamEvent>(4);
+        assert!(matches!(h.subscribe(root(), etx), Reply::Ok));
+
+        let (tx, rx) = sync_channel::<Reply>(1);
+        h.core.config_set(ConfigChange::DryRun(true), root(), tx);
+        h.pump_writer();
+
+        assert!(matches!(rx.try_recv().unwrap(), Reply::Ok));
+        assert!(h.core.config.dry_run);
+
+        let (wt, _) = mpsc::channel();
+        let reloaded = Core::load(&h.path, wt);
+        assert!(reloaded.config.dry_run, "the change was persisted to disk");
+
+        assert!(matches!(
+            erx.try_recv().unwrap().event,
+            Event::ConfigChanged
+        ));
+    }
+
+    #[test]
+    fn config_set_rejecting_an_invalid_change_touches_neither_file_nor_running_config() {
+        let mut h = Harness::new("");
+        let (tx, rx) = sync_channel::<Reply>(1);
+        // "bogus" is not a real sensor name -> the whole config fails validation.
+        h.core
+            .config_set(ConfigChange::Sensors(vec!["bogus".to_owned()]), root(), tx);
+
+        assert!(matches!(rx.try_recv().unwrap(), Reply::Error(_)));
+        assert!(h.jobs.try_recv().is_err(), "nothing was written");
+        assert_eq!(h.core.config.sensors, vec![SensorName::Usb]);
+    }
+
+    #[test]
+    fn set_luks_destroy_engaged_is_refused_without_an_acknowledged_target() {
+        let mut h = Harness::new("");
+        assert!(h.core.config.luks_destroy.is_none());
+        let (tx, rx) = sync_channel::<Reply>(1);
+        h.core.set_luks_destroy_engaged(true, root(), tx);
+        assert!(matches!(rx.try_recv().unwrap(), Reply::Error(_)));
+        assert!(!h.core.luks_destroy_engaged);
+    }
+
+    #[test]
+    fn set_luks_destroy_engaged_succeeds_with_an_acknowledged_target_and_reflects_in_get_config() {
+        let mut h = Harness::new(
+            "[response.luks_destroy]\ni_understand_this_is_irreversible = true\n\
+             target_header = \"/dev/nvme0n1p3\"\n",
+        );
+        assert!(h.core.config.luks_destroy.is_some());
+
+        let (tx, rx) = sync_channel::<Reply>(1);
+        h.core.set_luks_destroy_engaged(true, root(), tx);
+        assert!(matches!(rx.try_recv().unwrap(), Reply::Ok));
+        assert!(h.core.luks_destroy_engaged);
+        assert!(h.core.config_payload().luks_destroy.unwrap().engaged);
+
+        let (tx2, rx2) = sync_channel::<Reply>(1);
+        h.core.set_luks_destroy_engaged(false, root(), tx2);
+        assert!(matches!(rx2.try_recv().unwrap(), Reply::Ok));
+        assert!(!h.core.luks_destroy_engaged);
+    }
+
+    #[test]
+    fn engaged_flag_is_cleared_when_a_config_change_drops_luks_destroy() {
+        let mut h = Harness::new(
+            "[response.luks_destroy]\ni_understand_this_is_irreversible = true\n\
+             target_header = \"/dev/nvme0n1p3\"\n",
+        );
+        let (tx, _rx) = sync_channel::<Reply>(1);
+        h.core.set_luks_destroy_engaged(true, root(), tx);
+        assert!(h.core.luks_destroy_engaged);
+
+        // Reload onto a file with no [response.luks_destroy] at all.
+        std::fs::write(&h.path, "").unwrap();
+        let (tx, rx) = sync_channel::<Reply>(1);
+        h.core.reload(tx);
+        h.pump_writer();
+        assert!(matches!(rx.try_recv().unwrap(), Reply::Ok));
+
+        assert!(h.core.config.luks_destroy.is_none());
+        assert!(
+            !h.core.luks_destroy_engaged,
+            "an engaged flag must not survive its target leaving the config"
+        );
+    }
+
+    #[test]
+    fn engaged_flag_is_cleared_when_the_config_change_retargets_luks_destroy() {
+        // The other half of the drop case above: `luks_destroy` stays
+        // configured, but a *different* target replaces it. The operator
+        // confirmed the old header, not this one — the engagement must not
+        // carry over.
+        let mut h = Harness::new(
+            "[response.luks_destroy]\ni_understand_this_is_irreversible = true\n\
+             target_header = \"/dev/nvme0n1p3\"\n",
+        );
+        let (tx, _rx) = sync_channel::<Reply>(1);
+        h.core.set_luks_destroy_engaged(true, root(), tx);
+        assert!(h.core.luks_destroy_engaged);
+
+        std::fs::write(
+            &h.path,
+            "[response.luks_destroy]\ni_understand_this_is_irreversible = true\n\
+             target_header = \"/dev/sda\"\n",
+        )
+        .unwrap();
+        let (tx, rx) = sync_channel::<Reply>(1);
+        h.core.reload(tx);
+        h.pump_writer();
+        assert!(matches!(rx.try_recv().unwrap(), Reply::Ok));
+
+        assert!(
+            h.core.config.luks_destroy.is_some(),
+            "luks_destroy is still configured, just retargeted"
+        );
+        assert!(
+            !h.core.luks_destroy_engaged,
+            "an engaged flag must not carry over to a target the operator never confirmed"
+        );
+    }
+
+    #[test]
+    fn engaged_flag_survives_an_unrelated_config_change_to_the_same_target() {
+        let mut h = Harness::new(
+            "[response.luks_destroy]\ni_understand_this_is_irreversible = true\n\
+             target_header = \"/dev/nvme0n1p3\"\n",
+        );
+        let (tx, _rx) = sync_channel::<Reply>(1);
+        h.core.set_luks_destroy_engaged(true, root(), tx);
+        assert!(h.core.luks_destroy_engaged);
+
+        // config_set touches dry_run only — the luks_destroy target is untouched.
+        let (tx, rx) = sync_channel::<Reply>(1);
+        h.core.config_set(ConfigChange::DryRun(true), root(), tx);
+        h.pump_writer();
+        assert!(matches!(rx.try_recv().unwrap(), Reply::Ok));
+
+        assert!(
+            h.core.luks_destroy_engaged,
+            "an unrelated config change must not disengage a still-valid target"
+        );
+    }
+
+    #[test]
+    fn disarm_clears_the_luks_destroy_engage_toggle() {
+        // Decision recorded in CLAUDE.md (2026-09-08): the destructive opt-in is
+        // scoped to one armed session — a disarm clears it, so re-engaging
+        // always walks the typed-`DESTROY` fence again.
+        let mut h = Harness::new(
+            "[response.luks_destroy]\ni_understand_this_is_irreversible = true\n\
+             target_header = \"/dev/nvme0n1p3\"\n",
+        );
+        h.core.sensor_ok = true;
+        h.core.config.sensors.clear();
+        h.core.responders.clear();
+        h.core.arm(root()).unwrap();
+
+        let (tx, _rx) = sync_channel::<Reply>(1);
+        h.core.set_luks_destroy_engaged(true, root(), tx);
+        assert!(h.core.luks_destroy_engaged);
+
+        let (etx, erx) = sync_channel::<StreamEvent>(8);
+        assert!(matches!(h.subscribe(root(), etx), Reply::Ok));
+
+        h.core.disarm(root());
+        assert!(!h.core.armed);
+        assert!(
+            !h.core.luks_destroy_engaged,
+            "a disarm must clear the runtime engage toggle"
+        );
+
+        // Other clients learn the engaged state changed (via ConfigChanged, the
+        // "re-fetch GetConfig" signal), alongside the Disarmed event.
+        let mut events = Vec::new();
+        while let Ok(se) = erx.try_recv() {
+            events.push(se.event);
+        }
+        assert!(events.iter().any(|e| matches!(e, Event::Disarmed)));
+        assert!(events.iter().any(|e| matches!(e, Event::ConfigChanged)));
+    }
+
+    #[test]
+    fn a_new_subscriber_receives_the_event_backlog_before_anything_live() {
+        let mut h = Harness::new("");
+        h.core.broadcast(Event::Armed);
+        h.core.broadcast(Event::Disarmed);
+
+        let (tx, _rx) = sync_channel::<StreamEvent>(4);
+        let (reply, backlog) = h.subscribe_full(root(), tx);
+        assert!(matches!(reply, Reply::Ok));
+        assert_eq!(backlog.len(), 2);
+        assert!(matches!(backlog[0].event, Event::Armed));
+        assert!(matches!(backlog[1].event, Event::Disarmed));
+    }
+
+    #[test]
+    fn event_backlog_is_capped() {
+        let mut h = Harness::new("");
+        for _ in 0..(EVENT_BACKLOG_CAP + 10) {
+            h.core.broadcast(Event::Disarmed);
+        }
+        assert_eq!(h.core.event_backlog.len(), EVENT_BACKLOG_CAP);
+    }
+
+    #[test]
+    fn reload_failure_broadcasts_reload_failed() {
+        let mut h = Harness::new("");
+        let (etx, erx) = sync_channel::<StreamEvent>(4);
+        assert!(matches!(h.subscribe(root(), etx), Reply::Ok));
+
+        std::fs::write(&h.path, "not = = valid toml").unwrap();
+        let (tx, rx) = sync_channel::<Reply>(1);
+        h.core.reload(tx);
+        h.pump_writer();
+        assert!(matches!(rx.try_recv().unwrap(), Reply::Error(_)));
+        assert!(h.core.config_stale);
+
+        assert!(matches!(
+            erx.try_recv().unwrap().event,
+            Event::ReloadFailed(_)
+        ));
+    }
+
+    #[test]
+    fn armed_dry_run_kill_dispatches_and_broadcasts_would_kill() {
+        let mut h = Harness::new("[response]\ndry_run = true\npower_action = \"none\"\n");
+        h.core.armed = true;
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        h.core.responders = vec![Arc::new(Recorder(Arc::clone(&seen))) as Arc<dyn Responder>];
+
+        let (tx, rx) = sync_channel::<StreamEvent>(4);
+        assert!(matches!(h.subscribe(root(), tx), Reply::Ok));
+
+        h.core
+            .on_sensor_event(added(Some(UsbId::new(0x0781, 0x5567))));
+
+        for _ in 0..50 {
+            if !seen.lock().unwrap().is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            1,
+            "the kill was actually dispatched to the responder, not skipped"
+        );
+
+        let mut saw_would_kill = false;
+        while let Ok(se) = rx.try_recv() {
+            if matches!(se.event, Event::WouldKill(_)) {
+                saw_would_kill = true;
+            }
+        }
+        assert!(
+            saw_would_kill,
+            "an armed dry-run kill must broadcast WouldKill, not go silent"
+        );
+    }
+
+    #[test]
+    fn armed_kill_with_power_action_none_also_broadcasts_would_kill() {
+        // Not dry_run — power_action = "none" is the *other* documented safety
+        // belt (the hardware-gate protocol, step 0.0, treats them as two
+        // independent belts), and it is just as silent to a subscriber: the
+        // kill dispatches for real, but the poweroff responder's plan is
+        // Skip, so nothing visibly happens on the machine either.
+        let mut h = Harness::new("[response]\ndry_run = false\npower_action = \"none\"\n");
+        h.core.armed = true;
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        h.core.responders = vec![Arc::new(Recorder(Arc::clone(&seen))) as Arc<dyn Responder>];
+
+        let (tx, rx) = sync_channel::<StreamEvent>(4);
+        assert!(matches!(h.subscribe(root(), tx), Reply::Ok));
+
+        h.core
+            .on_sensor_event(added(Some(UsbId::new(0x0781, 0x5567))));
+
+        for _ in 0..50 {
+            if !seen.lock().unwrap().is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        assert!(!seen.lock().unwrap()[0].dry_run);
+
+        let mut saw_would_kill = false;
+        while let Ok(se) = rx.try_recv() {
+            if matches!(se.event, Event::WouldKill(_)) {
+                saw_would_kill = true;
+            }
+        }
+        assert!(
+            saw_would_kill,
+            "power_action = none must also broadcast WouldKill, not go silent"
+        );
+    }
+
+    #[test]
+    fn armed_real_kill_does_not_broadcast_would_kill() {
+        // The mirror case: dry_run = false AND power_action != none is a
+        // genuine kill, not a silent belt, and must NOT also be reported as a
+        // would-kill — that would misdescribe a real dispatch as hypothetical.
+        let mut h = Harness::new("[response]\ndry_run = false\npower_action = \"poweroff\"\n");
+        h.core.armed = true;
+        h.core.responders.clear(); // don't actually attempt a poweroff in a test
+
+        let (tx, rx) = sync_channel::<StreamEvent>(4);
+        assert!(matches!(h.subscribe(root(), tx), Reply::Ok));
+
+        h.core
+            .on_sensor_event(added(Some(UsbId::new(0x0781, 0x5567))));
+
+        let mut saw_would_kill = false;
+        while let Ok(se) = rx.try_recv() {
+            if matches!(se.event, Event::WouldKill(_)) {
+                saw_would_kill = true;
+            }
+        }
+        assert!(
+            !saw_would_kill,
+            "a real kill must not also be reported as a would-kill"
+        );
+    }
+
+    #[test]
+    fn armed_kill_with_power_none_but_luks_destroy_engaged_does_not_broadcast_would_kill() {
+        // `power = "none"` alone is a silent belt (test above). But with LUKS
+        // destruction engaged the Action carries `luks_destroy: true` and the
+        // LUKS responder acts on it for real — the kill is no longer
+        // hypothetical, so it must NOT be announced as a would-kill (a latent
+        // trap once the wipe stops being a stub — invariant 3).
+        let mut h = Harness::new(
+            "[response]\ndry_run = false\npower_action = \"none\"\n\
+             [response.luks_destroy]\ni_understand_this_is_irreversible = true\n\
+             target_header = \"/dev/nvme0n1p3\"\n",
+        );
+        h.core.armed = true;
+        h.core.responders.clear();
+        let (tx, _rx0) = sync_channel::<Reply>(1);
+        h.core.set_luks_destroy_engaged(true, root(), tx);
+        assert!(h.core.luks_destroy_engaged);
+
+        let (tx, rx) = sync_channel::<StreamEvent>(8);
+        assert!(matches!(h.subscribe(root(), tx), Reply::Ok));
+
+        h.core
+            .on_sensor_event(added(Some(UsbId::new(0x0781, 0x5567))));
+
+        let mut saw_would_kill = false;
+        while let Ok(se) = rx.try_recv() {
+            if matches!(se.event, Event::WouldKill(_)) {
+                saw_would_kill = true;
+            }
+        }
+        assert!(
+            !saw_would_kill,
+            "a kill that runs the LUKS responder for real is not a would-kill"
+        );
     }
 
     #[test]
@@ -2004,11 +2749,11 @@ mod tests {
     #[test]
     fn subscribers_get_device_events_and_dead_ones_are_pruned() {
         let mut h = Harness::new("");
-        let (tx, rx) = sync_channel::<Event>(8);
+        let (tx, rx) = sync_channel::<StreamEvent>(8);
         assert!(matches!(h.subscribe(root(), tx), Reply::Ok));
         h.core
             .on_sensor_event(added(Some(UsbId::new(0x1050, 0x0407))));
-        assert!(matches!(rx.recv().unwrap(), Event::DeviceAdded(_)));
+        assert!(matches!(rx.recv().unwrap().event, Event::DeviceAdded(_)));
 
         drop(rx);
         h.core
@@ -2159,14 +2904,14 @@ mod tests {
     #[test]
     fn a_sensor_restart_reaches_subscribers() {
         let mut h = Harness::new("");
-        let (tx, rx) = sync_channel::<Event>(8);
+        let (tx, rx) = sync_channel::<StreamEvent>(8);
         assert!(matches!(h.subscribe(root(), tx), Reply::Ok));
 
         h.core.on_sensor_restarting();
 
         let mut got = Vec::new();
-        while let Ok(ev) = rx.try_recv() {
-            got.push(ev);
+        while let Ok(se) = rx.try_recv() {
+            got.push(se.event);
         }
         assert!(got.iter().any(|e| matches!(e, Event::SensorStopped)));
         assert!(got.iter().any(|e| matches!(e, Event::EventsLost)));

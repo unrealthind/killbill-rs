@@ -5,7 +5,10 @@
 //!
 //! * **[`Command`]** — client → daemon, expects a [`Reply`].
 //! * **[`Reply`]** — daemon → client, answers one command.
-//! * **[`Event`]** — daemon → subscribed clients, unsolicited.
+//! * **[`Event`]** — daemon → subscribed clients, unsolicited. Carried on the
+//!   wire inside a [`StreamEvent`] envelope, never bare — a subscription's
+//!   backlog replay and its live events are both `StreamEvent` frames, so a
+//!   subscriber reads one frame shape throughout the connection.
 //!
 //! Wire format: a 4-byte big-endian body length, then a `serde_json` body
 //! ([`encode`] / [`decode`]). JSON is chosen for a learning codebase — readable
@@ -116,6 +119,101 @@ pub struct StatusPayload {
     pub config_stale: bool,
 }
 
+/// What to do if a sensor reports lost events. Mirrors `response.on_sensor_gap`
+/// in config (`killbilld::config::SensorGapAction` is the validated,
+/// daemon-internal twin of this wire type).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[non_exhaustive]
+#[serde(rename_all = "snake_case")]
+pub enum OnSensorGap {
+    /// Surface `events_lost` in `status`, log loudly, keep running.
+    #[default]
+    Warn,
+    /// Treat the gap as an unauthorized change: fire a kill.
+    Kill,
+}
+
+impl std::fmt::Display for OnSensorGap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            OnSensorGap::Warn => "warn",
+            OnSensorGap::Kill => "kill",
+        })
+    }
+}
+
+/// The LUKS-header-destruction slice of [`ConfigPayload`].
+///
+/// `acknowledged` is always `true` when this is present in a `ConfigPayload` —
+/// `killbilld`'s `config::validate` only ever produces a `Some`
+/// `Config::luks_destroy` once `i_understand_this_is_irreversible` has been
+/// checked, so a target that is configured but *not* acknowledged fails
+/// validation and the whole config is rejected (invariant 2), not surfaced
+/// here as a half-armed state. The field is kept explicit anyway rather than
+/// implied, so a client never has to know that rule to render this correctly.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LuksDestroyInfo {
+    pub acknowledged: bool,
+    /// The target block device path, e.g. `/dev/nvme0n1p3`.
+    pub target_header: String,
+    /// The separate runtime toggle set by [`Command::SetLuksDestroyEngaged`].
+    /// Being configured and acknowledged is necessary but not sufficient for a
+    /// kill to actually destroy the header — this must also be `true`
+    /// (invariant 4: the dangerous thing needs its own distinctly-named
+    /// opt-in, on top of config). Never persisted; every daemon start begins
+    /// with this `false`.
+    pub engaged: bool,
+}
+
+/// A read-only snapshot of the daemon's configuration, answering
+/// [`Command::GetConfig`]. Reflects the currently **running** (validated)
+/// config, not the raw file — see `validation_error` for when they differ.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigPayload {
+    pub armed_at_boot: bool,
+    /// v1 only ever contains `"usb"`, but this is the raw string list (as
+    /// config-file `detection.sensors` is), not a fixed enum, since the whole
+    /// point of the field is to stay pluggable.
+    pub sensors: Vec<String>,
+    pub dry_run: bool,
+    pub power_action: PowerAction,
+    pub on_sensor_gap: OnSensorGap,
+    /// `None` if `[response.luks_destroy]` is absent from the running config.
+    pub luks_destroy: Option<LuksDestroyInfo>,
+    /// `Some` if the config **on disk** currently fails validation — the
+    /// fields above are the last-good running config, not a reflection of the
+    /// broken file (invariant 2: the daemon never runs on a half-understood
+    /// config, so there is nothing else to show).
+    pub validation_error: Option<String>,
+}
+
+/// One field of the running config, as [`Command::ConfigSet`] changes it. The
+/// daemon applies this to a **clone** of its in-memory raw config, re-runs
+/// validation on the whole thing, and only on success persists and swaps —
+/// exactly like a `whitelist add` (invariant 2: a change that would make the
+/// config invalid touches neither the file nor the running state).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+#[serde(rename_all = "snake_case", tag = "field", content = "value")]
+pub enum ConfigChange {
+    DryRun(bool),
+    PowerAction(PowerAction),
+    ArmedAtBoot(bool),
+    Sensors(Vec<String>),
+    OnSensorGap(OnSensorGap),
+}
+
+/// One [`Event`], stamped with when the daemon broadcast it. This is the
+/// subscribe stream's actual wire envelope — both the backlog replay and every
+/// live push after it carry this, not a bare `Event` (charter §8).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamEvent {
+    /// RFC 3339, UTC, second precision (e.g. `"2024-01-02T03:04:05Z"`). See
+    /// [`rfc3339_now`].
+    pub at: String,
+    pub event: Event,
+}
+
 /// A request from a client. `#[non_exhaustive]`: the daemon answers an
 /// unrecognized command with [`Reply::Error`] rather than the protocol breaking.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -144,7 +242,31 @@ pub enum Command {
     /// Re-read and re-validate the config file. Refused if the new file is
     /// invalid; prior state is kept (invariant 2).
     ReloadConfig,
+    /// Return a [`Reply::Config`] snapshot of the running configuration.
+    /// Unlike `GetStatus`/`ListDevices`/`WhitelistList`, this **requires
+    /// root** — a `LuksDestroyInfo::target_header` is arguably as sensitive
+    /// as the whitelist and config-mutating commands it sits next to on the
+    /// same closed allow-list ([`Command::requires_root`]).
+    GetConfig,
+    /// Change one field of the running config. Validated as a whole against a
+    /// clone before anything is written or swapped (invariant 2) — see
+    /// [`ConfigChange`].
+    ConfigSet(ConfigChange),
+    /// Engage (`true`) or disengage (`false`) LUKS header destruction on a
+    /// future kill. Refused unless the running config has an acknowledged
+    /// `[response.luks_destroy]` — engaging is a *runtime* opt-in layered on
+    /// top of the *config-time* one (invariant 4), and neither alone is
+    /// enough. The header wipe itself stays a stub in v1 regardless
+    /// (invariant 3); this only affects what `Action::luks_destroy` reads as.
+    SetLuksDestroyEngaged(bool),
     /// Ask the daemon to stream [`Event`]s on this connection until it closes.
+    /// A plain `Reply::Ok`/`Reply::Error` acks the subscription as before; on
+    /// success the connection then writes the current event backlog as
+    /// individual [`StreamEvent`] frames, oldest first, before switching to
+    /// forwarding live ones — never one batched frame (a 200-entry backlog
+    /// stays well inside [`MAX_CONTROL_FRAME`] per-frame either way, but
+    /// batching is needless coupling between the backlog depth and the frame
+    /// limit that individual frames simply don't have).
     Subscribe,
 }
 
@@ -183,6 +305,8 @@ pub enum Reply {
     /// The kill reasons a dry run produced, answering [`Command::RunDryRun`].
     /// Empty means nothing connected would trigger a kill.
     DryRun(Vec<KillReason>),
+    /// Answers [`Command::GetConfig`].
+    Config(ConfigPayload),
     /// Command failed; the string is a human-readable reason.
     Error(String),
 }
@@ -210,6 +334,20 @@ pub enum Event {
     /// restarts; the daemon refuses to (re)arm while it holds. Advisory unless
     /// `on_sensor_gap = "kill"`, which fires the power action instead.
     EventsLost,
+    /// The whitelist changed (`WhitelistAdd`/`WhitelistRemove` succeeded). A
+    /// prompt to re-fetch it — `WhitelistList` — rather than a diff.
+    WhitelistChanged,
+    /// The running config changed for a reason other than the whitelist
+    /// (`ConfigSet` or a successful `ReloadConfig`). A prompt to re-fetch
+    /// [`Command::GetConfig`] and [`Command::GetStatus`], not a diff.
+    ConfigChanged,
+    /// A [`Command::ReloadConfig`] was rejected — the file could not be read,
+    /// failed validation, or (while armed) would have left a responder unable
+    /// to act. The running config and armed state are unchanged (invariant
+    /// 2); the string is the same human-readable reason the caller got back.
+    /// Broadcast (not just answered to the caller) because it also means
+    /// `status.config_stale` just became `true` for every other client.
+    ReloadFailed(String),
 }
 
 /// The maximum size of a whole control-socket frame — header **and** body —
@@ -227,6 +365,59 @@ pub enum Event {
 /// reply ever needs more, the fix is a paged command, not a larger buffer —
 /// a hostile client must not be able to make three processes allocate more.
 pub const MAX_CONTROL_FRAME: usize = 64 * 1024;
+
+/// The current wall-clock time as RFC 3339 UTC, second precision (e.g.
+/// `"2024-01-02T03:04:05Z"`) — used to stamp every [`StreamEvent`] as the
+/// daemon broadcasts it.
+///
+/// Hand-rolled from [`std::time::SystemTime`] rather than pulling in a date
+/// crate for one timestamp string: no dependency, no `unsafe` (`time`'s
+/// UTC-only path needs none either, but this needs nothing at all), and it is
+/// exactly as testable as a library would be — see the test vectors below.
+/// Not meant for anything sub-second or performance-sensitive; it is called
+/// once per broadcast event, never on the kill path itself.
+#[must_use]
+pub fn rfc3339_now() -> String {
+    format_rfc3339(std::time::SystemTime::now())
+}
+
+fn format_rfc3339(t: std::time::SystemTime) -> String {
+    let secs = match t.duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => d.as_secs() as i64,
+        // A clock set before 1970 (or a test vector probing it) — still a
+        // real instant, just a negative one; render it rather than panic.
+        Err(e) => -(e.duration().as_secs() as i64),
+    };
+    let days = secs.div_euclid(86_400);
+    let secs_of_day = secs.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    let hour = secs_of_day / 3600;
+    let minute = (secs_of_day % 3600) / 60;
+    let second = secs_of_day % 60;
+    // `{year:04}` is proleptic Gregorian with no era sign: not RFC 3339 for
+    // year < 1000 or a negative year, neither of which can occur here — this is
+    // only ever called for a real wall-clock instant, always post-1970 (the
+    // pre-epoch `Err` branch above exists purely for the test vectors).
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
+/// Days-since-1970-01-01 to a proleptic-Gregorian `(year, month, day)`.
+/// Howard Hinnant's `civil_from_days`
+/// (<http://howardhinnant.github.io/date_algorithms.html>), public domain —
+/// correct over the entire `i64` range, leap years included.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097) as u64; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
+    let year = if month <= 2 { y + 1 } else { y };
+    (year, month, day)
+}
 
 /// Length-prefix header size, in bytes.
 const HEADER_LEN: usize = 4;
@@ -379,6 +570,150 @@ mod tests {
         assert!(Command::RunDryRun.requires_root());
         assert!(Command::Subscribe.requires_root());
         assert!(Command::WhitelistRemove(UsbId::new(0x1050, 0x0407)).requires_root());
+        // Added in step 1: privileged by default (the allow-list is closed),
+        // asserted explicitly per the doc comment's promise.
+        assert!(Command::GetConfig.requires_root());
+        assert!(Command::ConfigSet(ConfigChange::DryRun(true)).requires_root());
+        assert!(Command::SetLuksDestroyEngaged(true).requires_root());
+    }
+
+    #[test]
+    fn config_payload_round_trips_with_and_without_luks_destroy() {
+        let with_luks = Reply::Config(ConfigPayload {
+            armed_at_boot: true,
+            sensors: vec!["usb".to_owned()],
+            dry_run: false,
+            power_action: PowerAction::PowerOff,
+            on_sensor_gap: OnSensorGap::Kill,
+            luks_destroy: Some(LuksDestroyInfo {
+                acknowledged: true,
+                target_header: "/dev/nvme0n1p3".to_owned(),
+                engaged: false,
+            }),
+            validation_error: None,
+        });
+        let json = serde_json::to_string(&with_luks).unwrap();
+        assert_eq!(serde_json::from_str::<Reply>(&json).unwrap(), with_luks);
+
+        let without_luks = Reply::Config(ConfigPayload {
+            armed_at_boot: false,
+            sensors: vec!["usb".to_owned()],
+            dry_run: true,
+            power_action: PowerAction::Halt,
+            on_sensor_gap: OnSensorGap::Warn,
+            luks_destroy: None,
+            validation_error: Some("configuration is invalid".to_owned()),
+        });
+        let json = serde_json::to_string(&without_luks).unwrap();
+        assert_eq!(serde_json::from_str::<Reply>(&json).unwrap(), without_luks);
+    }
+
+    #[test]
+    fn config_change_variants_round_trip() {
+        for change in [
+            ConfigChange::DryRun(true),
+            ConfigChange::PowerAction(PowerAction::Halt),
+            ConfigChange::ArmedAtBoot(false),
+            ConfigChange::Sensors(vec!["usb".to_owned()]),
+            ConfigChange::OnSensorGap(OnSensorGap::Kill),
+        ] {
+            let cmd = Command::ConfigSet(change.clone());
+            let json = serde_json::to_string(&cmd).unwrap();
+            assert_eq!(serde_json::from_str::<Command>(&json).unwrap(), cmd);
+        }
+    }
+
+    #[test]
+    fn set_luks_destroy_engaged_round_trips() {
+        for want in [true, false] {
+            let cmd = Command::SetLuksDestroyEngaged(want);
+            let json = serde_json::to_string(&cmd).unwrap();
+            assert_eq!(serde_json::from_str::<Command>(&json).unwrap(), cmd);
+        }
+    }
+
+    #[test]
+    fn stream_event_round_trips() {
+        let se = StreamEvent {
+            at: "2024-01-02T03:04:05Z".to_owned(),
+            event: Event::WhitelistChanged,
+        };
+        let json = serde_json::to_string(&se).unwrap();
+        assert_eq!(serde_json::from_str::<StreamEvent>(&json).unwrap(), se);
+    }
+
+    #[test]
+    fn new_events_round_trip() {
+        for event in [
+            Event::WhitelistChanged,
+            Event::ConfigChanged,
+            Event::ReloadFailed("the config on disk is invalid".to_owned()),
+        ] {
+            let json = serde_json::to_string(&event).unwrap();
+            assert_eq!(serde_json::from_str::<Event>(&json).unwrap(), event);
+        }
+    }
+
+    #[test]
+    fn on_sensor_gap_default_is_warn_and_json_is_one_lowercase_word() {
+        assert_eq!(OnSensorGap::default(), OnSensorGap::Warn);
+        assert_eq!(
+            serde_json::to_string(&OnSensorGap::Kill).unwrap(),
+            "\"kill\""
+        );
+    }
+
+    #[test]
+    fn rfc3339_now_has_the_right_shape() {
+        // Not pinned to a value (it's wall-clock), just the shape every
+        // consumer (and the length-prefixed frame budget) can rely on:
+        // exactly 20 ASCII bytes, seconds precision, `Z` suffix.
+        let s = rfc3339_now();
+        assert_eq!(s.len(), 20, "got: {s}");
+        assert!(s.ends_with('Z'), "got: {s}");
+        assert_eq!(s.as_bytes()[4], b'-');
+        assert_eq!(s.as_bytes()[7], b'-');
+        assert_eq!(s.as_bytes()[10], b'T');
+        assert_eq!(s.as_bytes()[13], b':');
+        assert_eq!(s.as_bytes()[16], b':');
+    }
+
+    #[test]
+    fn format_rfc3339_matches_known_instants() {
+        use std::time::{Duration, UNIX_EPOCH};
+
+        assert_eq!(
+            format_rfc3339(UNIX_EPOCH),
+            "1970-01-01T00:00:00Z",
+            "the epoch itself"
+        );
+        assert_eq!(
+            format_rfc3339(UNIX_EPOCH + Duration::from_secs(86_400)),
+            "1970-01-02T00:00:00Z",
+            "one day later"
+        );
+        // 946684800 is the well-known Unix time for 2000-01-01T00:00:00Z.
+        assert_eq!(
+            format_rfc3339(UNIX_EPOCH + Duration::from_secs(946_684_800)),
+            "2000-01-01T00:00:00Z"
+        );
+        // 59 days after that (Jan has 31) is the leap day the whole point of
+        // this test is to exercise.
+        assert_eq!(
+            format_rfc3339(UNIX_EPOCH + Duration::from_secs(946_684_800 + 59 * 86_400)),
+            "2000-02-29T00:00:00Z",
+            "leap day"
+        );
+        // A day before the epoch: still a real instant, must render, not panic.
+        assert_eq!(
+            format_rfc3339(UNIX_EPOCH - Duration::from_secs(86_400)),
+            "1969-12-31T00:00:00Z"
+        );
+        // Mid-day, to exercise the H:M:S math, not just the date.
+        assert_eq!(
+            format_rfc3339(UNIX_EPOCH + Duration::from_secs(946_684_800 + 3661)),
+            "2000-01-01T01:01:01Z"
+        );
     }
 
     #[test]
