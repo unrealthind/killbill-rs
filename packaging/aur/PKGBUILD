@@ -17,7 +17,7 @@ source=("${pkgname}-${pkgver}.tar.gz::${url}/archive/refs/tags/v${pkgver}.tar.gz
 # commit behind `main`'s own tree — that is expected and correct: the digest
 # describes the tag archive, not `main`. Regenerate with `updpkgsums` on every
 # version bump. check-release.sh fails the release if this is left as 'SKIP'.
-sha256sums=('0622c0ba9201b74cc9a62e16c3b2626f16eb46ec661297a2fe07ae7a298e959e')
+sha256sums=('d3fd71902ad73fd3d3699582e38afd46b3a8fd7af33c9c8de26cc41c7032f2b3')
 
 prepare() {
 	cd "${pkgname}-${pkgver}"
