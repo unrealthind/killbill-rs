@@ -51,6 +51,25 @@ that matter most:
 - **Denial of service by someone who is already root** on the machine. The
   threat model is a single trusted operator; root can always stop the daemon.
 
+## Verifying release artifacts
+
+Every release attaches `SHA256SUMS` and a detached minisign signature for each
+file. The signing public key (minisign key ID `C03C331F753B2D0D`) is:
+
+```
+untrusted comment: minisign public key C03C331F753B2D0D
+RWQNLTt1HzM8wP1YLZXT+/3VnT8s2t8ZA+UvQRXCZ8ze8Eqjc3ZHW1dK
+```
+
+```bash
+minisign -Vm SHA256SUMS -P RWQNLTt1HzM8wP1YLZXT+/3VnT8s2t8ZA+UvQRXCZ8ze8Eqjc3ZHW1dK
+sha256sum -c SHA256SUMS
+```
+
+The secret key is held offline by the maintainer and is never on a build or
+development machine. If the key is ever rotated, the new key is announced in a
+release and committed here in the same change.
+
 ## Design guarantees
 
 The threat model, the invariants, and the reasoning behind each are in

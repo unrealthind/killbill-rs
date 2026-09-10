@@ -16,6 +16,13 @@ audit-*.md
 .mcp.json
 *.claude.md
 
+# --- Release signing keys -------------------------------------------
+# The minisign secret key is the release trust root and must never enter the
+# repo or this machine's history. The public key lives in SECURITY.md.
+*.key
+killbill-rs.pub
+minisign.key
+
 # --- Local test artifacts --------------------------------------------
 # Throwaway daemon configs for hardware testing, never installed.
 /test-config.toml

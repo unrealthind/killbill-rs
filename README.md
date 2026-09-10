@@ -159,11 +159,15 @@ sudo packaging/install.sh --from-build
 ### Verifying downloads
 
 Release artifacts are signed with [minisign](https://jedisct1.github.io/minisign/).
-The public key is published in the GitHub release notes and at
-`https://github.com/unrealthind/killbill-rs`.
+The public key is committed in [`SECURITY.md`](SECURITY.md) and repeated in every
+release's notes:
+
+```
+RWQNLTt1HzM8wP1YLZXT+/3VnT8s2t8ZA+UvQRXCZ8ze8Eqjc3ZHW1dK
+```
 
 ```bash
-minisign -Vm SHA256SUMS -P <published-public-key>
+minisign -Vm SHA256SUMS -P RWQNLTt1HzM8wP1YLZXT+/3VnT8s2t8ZA+UvQRXCZ8ze8Eqjc3ZHW1dK
 sha256sum -c SHA256SUMS
 ```
 
