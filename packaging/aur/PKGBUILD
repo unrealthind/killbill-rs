@@ -11,11 +11,13 @@ makedepends=('cargo')
 backup=('etc/killbill/config.toml')
 install="${pkgname}.install"
 source=("${pkgname}-${pkgver}.tar.gz::${url}/archive/refs/tags/v${pkgver}.tar.gz")
-# sha256 of the GitHub-generated tag archive
-# (github.com/unrealthind/killbill-rs/archive/refs/tags/v0.1.0.tar.gz).
-# Regenerate with `updpkgsums` (or curl | sha256sum) on every version bump;
-# packaging/scripts/check-release.sh fails the release if this is left as 'SKIP'.
-sha256sums=('e7b0c919edb227c828d0b82a369bb004055dd8a458ef7211554b84633ea798d8')
+# sha256 of the GitHub-generated archive for the *tag this PKGBUILD targets*
+# (github.com/unrealthind/killbill-rs/archive/refs/tags/v0.1.0.tar.gz), which is
+# what `source=` downloads. Computed after the tag was finalised, so it is one
+# commit behind `main`'s own tree — that is expected and correct: the digest
+# describes the tag archive, not `main`. Regenerate with `updpkgsums` on every
+# version bump. check-release.sh fails the release if this is left as 'SKIP'.
+sha256sums=('0622c0ba9201b74cc9a62e16c3b2626f16eb46ec661297a2fe07ae7a298e959e')
 
 prepare() {
 	cd "${pkgname}-${pkgver}"
