@@ -150,7 +150,7 @@ record "$UNIT"
 # --- default config, only if absent -----------------------------------
 install -d -m 0755 "$CONFIG_DIR"
 if [ ! -e "$CONFIG" ]; then
-	install -m 0640 "$example_src" "$CONFIG"
+	install -m 0600 "$example_src" "$CONFIG"
 	echo "install.sh: wrote default config to $CONFIG (disarmed)"
 else
 	echo "install.sh: keeping existing $CONFIG"

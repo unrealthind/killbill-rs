@@ -14,7 +14,7 @@ _kb_unit='killbilld.service'
 post_install() {
 	install -d -m 0755 "$_kb_config_dir"
 	if [ ! -e "$_kb_config" ] && [ -e "$_kb_example" ]; then
-		install -m 0640 "$_kb_example" "$_kb_config"
+		install -m 0600 "$_kb_example" "$_kb_config"
 		echo ">>> killbill-rs: wrote default config to ${_kb_config} (disarmed)"
 	fi
 	systemctl daemon-reload || true

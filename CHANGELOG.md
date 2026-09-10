@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.1.0] - 2026-XX-XX
+## [0.1.0] - 2026-09-09
 
 First public release — a fully working USB-kill daemon for distribution and
 testing.
@@ -53,13 +53,28 @@ testing.
   implemented.
 - No network activity and no telemetry. The only IPC is the local
   `SOCK_SEQPACKET` Unix socket (mode `0660`, `root:root`). The daemon refuses to
-  start if the socket's parent directory is group- or other-writable without the
-  sticky bit — the socket's mode and owner are applied by path after `bind(2)`.
+  start unless the socket's parent directory and every ancestor is root-owned and
+  not group/other-writable (the sticky bit is not an exemption) — the socket's
+  mode and owner are applied by path after `bind(2)`.
 - `SetLuksDestroyEngaged` carries no target on the wire, so the TUI's
   typed-`DESTROY` fence↔target binding is client-side; the daemon clears the
   runtime engage flag on any config retarget, on disarm, and on restart. To be
   closed (server-side target/generation check) before the header wipe is ever
   implemented.
+
+### Known limitations
+
+- `killbilld` does not enumerate already-connected USB devices at startup. It
+  counts only `add` events seen since it started, so `max_count` treats a device
+  present before the daemon started as zero. Seed the table with
+  `udevadm trigger --action=add --subsystem-match=usb` while disarmed. See
+  `killbill.conf(5)` and the README.
+- A configured `[response.luks_destroy]` target is hidden by the shipped unit's
+  `PrivateDevices=yes` and will fail the arm-time preflight until the
+  `killbilld.service.d/luks-destroy.conf` drop-in is installed. The preflight
+  error and `killbilld(8)` both say so.
+- Config comments are lost when the daemon rewrites the file (a `whitelist add`
+  or `config set`).
 
 [Unreleased]: https://github.com/unrealthind/killbill-rs/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/unrealthind/killbill-rs/releases/tag/v0.1.0

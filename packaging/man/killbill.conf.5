@@ -79,6 +79,30 @@ Integer, default
 How many copies of this
 .B id
 may be connected at once. A whitelisted device added beyond this count fires.
+.IP
+.B killbilld
+counts only devices whose
+.I add
+event it has seen since it started \(en it does
+.B not
+enumerate already-connected USB devices at startup (a documented v1
+limitation). A device present before
+.B killbilld
+started therefore counts as zero. To seed the table before arming, run
+.RS
+.EX
+udevadm trigger --action=add --subsystem-match=usb
+.EE
+.RE
+while disarmed. The resulting synthetic
+.I add
+events are recorded and never acted on. Do not run it while armed with
+.B on_sensor_gap
+set to
+.BR kill ,
+where the event burst can overflow the netlink receive buffer and fire a real
+.B SensorGap
+kill.
 .PP
 The whitelist suppresses
 .I additions
@@ -169,6 +193,15 @@ for the block to be accepted.
 .B target_header
 String. An absolute path to a block device under
 .IR /dev .
+The daemon checks at arm time that it exists and is a block device, and refuses
+to arm otherwise. Under the shipped systemd unit,
+.B PrivateDevices=yes
+hides the real
+.IR /dev ,
+so a valid target reports as missing until the
+.I killbilld.service.d/luks-destroy.conf
+drop-in is installed \(en see
+.BR killbilld (8).
 .PP
 There is a
 .I second,
