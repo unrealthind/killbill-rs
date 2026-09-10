@@ -68,8 +68,12 @@ jobs:
           tar -C "target/$TARGET/release" -czf \
             "dist/killbill-rs-${ver}-x86_64-linux-musl.tar.gz" \
             killbilld killbillctl killbill-tui
-          cp target/"$TARGET"/debian/*.deb dist/
-          cp target/"$TARGET"/generate-rpm/*.rpm dist/
+          # cargo-deb 3.x writes to target/debian/ even with --target; the rpm
+          # lands under the target triple. Locate both rather than assume.
+          find target -type f -name '*.deb' -exec cp {} dist/ \;
+          find target -type f -name '*.rpm' -exec cp {} dist/ \;
+          test -n "$(find dist -name '*.deb')" || { echo "no .deb produced" >&2; exit 1; }
+          test -n "$(find dist -name '*.rpm')" || { echo "no .rpm produced" >&2; exit 1; }
           ( cd dist && sha256sum ./* > SHA256SUMS )
           echo "version=$ver" >> "$GITHUB_OUTPUT"
 

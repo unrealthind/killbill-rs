@@ -98,9 +98,13 @@ license = "GPL-3.0-or-later"
 # Static musl binary: skip the automatic ELF dependency scan.
 auto-req = "no"
 requires = { systemd = "*" }
-post_install_script = { path = "packaging/rpm/post.sh", interpreter = "/bin/sh" }
-pre_uninstall_script = { path = "packaging/rpm/preun.sh", interpreter = "/bin/sh" }
-post_uninstall_script = { path = "packaging/rpm/postun.sh", interpreter = "/bin/sh" }
+# cargo-generate-rpm takes a string that is either script content or a path to
+# a file; these are paths, resolved from the directory the command runs in (the
+# repo root). RPM runs scriptlets under /bin/sh by default, matching the
+# `#!/bin/sh` in each file.
+post_install_script = "packaging/rpm/post.sh"
+pre_uninstall_script = "packaging/rpm/preun.sh"
+post_uninstall_script = "packaging/rpm/postun.sh"
 
 [[package.metadata.generate-rpm.assets]]
 source = "target/x86_64-unknown-linux-musl/release/killbilld"
