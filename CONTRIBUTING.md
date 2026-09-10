@@ -132,10 +132,23 @@ cargo deny check                        # no network deps, advisories clean
 sh packaging/scripts/check-release.sh   # PKGBUILD has a real digest, pkgver matches
 ```
 
-`check-release.sh` fails on the `sha256sums=('SKIP')` placeholder — clear it with
-`updpkgsums` (pacman-contrib) against the published release tarball and commit
-the real digest. CI (`.github/workflows/ci.yml`) runs the first four on every
-push; the release workflow runs `check-release.sh` before building artifacts.
+`check-release.sh` fails on the `sha256sums=('SKIP')` placeholder in
+`packaging/aur/PKGBUILD`. The digest is over the GitHub archive tarball
+`.../archive/refs/tags/vX.Y.Z.tar.gz`, which does not exist until the tag is
+pushed — so the **first** `release.yml` run for a new tag fails this gate by
+design. That is expected, not a bug. Sequence:
+
+1. Push the tag (see below). The `release.yml` build job fails at the
+   release-readiness gate.
+2. `updpkgsums packaging/aur/PKGBUILD` (pacman-contrib), or
+   `curl -sL <archive-url> | sha256sum`, then commit the real digest to `main`.
+3. Re-run the release from the Actions tab — `workflow_dispatch` with
+   `tag: vX.Y.Z` — which now passes the gate and builds the artifacts.
+
+CI (`.github/workflows/ci.yml`) runs the first four checks on every push; the
+release workflow runs `check-release.sh` before building artifacts. Every
+third-party action in both workflows is pinned to a commit SHA — bump those
+deliberately, never to a floating tag.
 
 Then: move the `CHANGELOG.md` `## [Unreleased]` items under a dated `## [X.Y.Z]`
 heading, commit, `git tag -a vX.Y.Z`, and push the tag — `release.yml` builds the

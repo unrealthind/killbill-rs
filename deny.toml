@@ -39,6 +39,10 @@ deny = [
     { name = "ureq" },
     { name = "curl" },
 ]
+# Not denied, but noted so a future reader does not rediscover it as an alarm:
+# `mio` is linked into `killbill-tui` only, via `crossterm`, purely as a poll
+# abstraction for terminal-input readiness. It opens no sockets, and it does not
+# reach `killbilld`. Invariant 8 (no network) is intact.
 
 [licenses]
 version = 2

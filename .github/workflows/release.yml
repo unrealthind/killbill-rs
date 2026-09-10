@@ -17,13 +17,15 @@ env:
   TARGET: x86_64-unknown-linux-musl
 
 jobs:
-  # NOTE: action refs are tags for readability — pin to full commit SHAs before
-  # publishing (security review, sub-phase 12.2).
+  # Third-party actions are pinned to a full commit SHA (trailing comment = the
+  # human-readable version). This job holds the minisign signing key and a
+  # contents:write token; a mutable tag here is a supply-chain hole. Bump
+  # deliberately.
   build:
     name: build static binaries + packages
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
 
@@ -36,7 +38,7 @@ jobs:
           rustup target add "$TARGET"
           sudo apt-get update && sudo apt-get install -y musl-tools
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7 # v2.9.2
 
       - name: Build (static musl, release)
         run: cargo build --workspace --release --locked --target "$TARGET"
@@ -45,17 +47,23 @@ jobs:
         run: cargo test --workspace --release --locked --target "$TARGET"
 
       - name: cargo-deb / cargo-generate-rpm
+        # Pin the packaging tools to an exact version — they run in the same job
+        # as the signing key and control the .deb/.rpm payload contents. --locked
+        # only honours each tool's own lockfile, not the version resolved here.
         run: |
-          cargo install cargo-deb cargo-generate-rpm --locked
+          cargo install cargo-deb --version 3.8.0 --locked
+          cargo install cargo-generate-rpm --version 0.21.0 --locked
           cargo deb -p killbilld --no-build --target "$TARGET"
           cargo generate-rpm -p killbilld --target "$TARGET"
 
       - name: Stage artifacts
         id: stage
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
         run: |
           set -eu
           ver="${GITHUB_REF_NAME#v}"
-          [ "$ver" = "$GITHUB_REF_NAME" ] && ver="${{ github.event.inputs.tag }}" && ver="${ver#v}"
+          [ "$ver" = "$GITHUB_REF_NAME" ] && ver="${INPUT_TAG#v}"
           mkdir -p dist
           tar -C "target/$TARGET/release" -czf \
             "dist/killbill-rs-${ver}-x86_64-linux-musl.tar.gz" \
@@ -73,7 +81,7 @@ jobs:
           set -eu
           test -n "$MINISIGN_SECRET_KEY" || { echo "MINISIGN_SECRET_KEY secret not set" >&2; exit 1; }
           sudo apt-get install -y minisign
-          printf '%s\n' "$MINISIGN_SECRET_KEY" > minisign.key
+          ( umask 077; printf '%s\n' "$MINISIGN_SECRET_KEY" > minisign.key )
           for f in dist/*; do
             case "$f" in *.minisig) continue ;; esac
             minisign -S -s minisign.key -m "$f" <<EOF
@@ -82,13 +90,13 @@ jobs:
           done
           shred -u minisign.key
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: release-${{ steps.stage.outputs.version }}
           path: dist/*
 
       - name: Draft GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           draft: true

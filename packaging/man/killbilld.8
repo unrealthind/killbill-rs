@@ -44,11 +44,11 @@ Configuration file. Default:
 .BR \-s ", " \-\-socket " " \fIPATH\fR
 Control socket path. Default:
 .IR /run/killbilld.sock .
-The daemon refuses to start if the socket's parent directory is writable by
-group or other without the sticky bit set: the socket's mode and owner are
-applied by path after
+The daemon refuses to start unless the socket's parent directory \(em and every
+ancestor \(em is root-owned and not group- or other-writable. The sticky bit is
+not an exemption. The socket's mode and owner are applied by path after
 .BR bind (2),
-so a writable parent is a symlink-swap window on that step.
+so a non-root-owned or writable ancestor is a symlink-swap window on that step.
 .TP
 .BR \-h ", " \-\-help
 Print help and exit.

@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.1.0] - 2026-XX-XX
+## [0.1.0] - 2026-09-09
 
 First public release — a fully working USB-kill daemon for distribution and
 testing.
@@ -53,8 +53,9 @@ testing.
   implemented.
 - No network activity and no telemetry. The only IPC is the local
   `SOCK_SEQPACKET` Unix socket (mode `0660`, `root:root`). The daemon refuses to
-  start if the socket's parent directory is group- or other-writable without the
-  sticky bit — the socket's mode and owner are applied by path after `bind(2)`.
+  start unless the socket's parent directory and every ancestor is root-owned and
+  not group/other-writable (the sticky bit is not an exemption) — the socket's
+  mode and owner are applied by path after `bind(2)`.
 - `SetLuksDestroyEngaged` carries no target on the wire, so the TUI's
   typed-`DESTROY` fence↔target binding is client-side; the daemon clears the
   runtime engage flag on any config retarget, on disarm, and on restart. To be
