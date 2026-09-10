@@ -71,21 +71,25 @@ unauthorized change occurs, powers the machine off so the LUKS disk re-locks.
 
 Ships killbilld (the daemon), killbillctl (CLI) and killbill-tui (terminal UI).
 Installed disarmed; arm it only after configuring a whitelist."""
+# Binary paths under `target/release/` are auto-remapped to the `--target`
+# directory by cargo-deb. Every other source path is resolved relative to this
+# manifest's directory (`killbilld/`), same as `license-file` above — so
+# repo-root files need `../`.
 assets = [
     ["target/release/killbilld", "usr/bin/", "755"],
     ["target/release/killbillctl", "usr/bin/", "755"],
     ["target/release/killbill-tui", "usr/bin/", "755"],
-    ["config.example.toml", "usr/share/killbill-rs/config.example.toml", "644"],
-    ["packaging/systemd/killbilld.service", "usr/lib/systemd/system/killbilld.service", "644"],
-    ["packaging/systemd/killbilld.service.d/luks-destroy.conf.example", "usr/share/killbill-rs/killbilld.service.d/luks-destroy.conf.example", "644"],
-    ["packaging/man/killbilld.8", "usr/share/man/man8/", "644"],
-    ["packaging/man/killbillctl.1", "usr/share/man/man1/", "644"],
-    ["packaging/man/killbill-tui.1", "usr/share/man/man1/", "644"],
-    ["packaging/man/killbill.conf.5", "usr/share/man/man5/", "644"],
-    ["README.md", "usr/share/doc/killbill-rs/README.md", "644"],
-    ["CHANGELOG.md", "usr/share/doc/killbill-rs/CHANGELOG.md", "644"],
+    ["../config.example.toml", "usr/share/killbill-rs/config.example.toml", "644"],
+    ["../packaging/systemd/killbilld.service", "usr/lib/systemd/system/killbilld.service", "644"],
+    ["../packaging/systemd/killbilld.service.d/luks-destroy.conf.example", "usr/share/killbill-rs/killbilld.service.d/luks-destroy.conf.example", "644"],
+    ["../packaging/man/killbilld.8", "usr/share/man/man8/", "644"],
+    ["../packaging/man/killbillctl.1", "usr/share/man/man1/", "644"],
+    ["../packaging/man/killbill-tui.1", "usr/share/man/man1/", "644"],
+    ["../packaging/man/killbill.conf.5", "usr/share/man/man5/", "644"],
+    ["../README.md", "usr/share/doc/killbill-rs/README.md", "644"],
+    ["../CHANGELOG.md", "usr/share/doc/killbill-rs/CHANGELOG.md", "644"],
 ]
-maintainer-scripts = "packaging/deb/"
+maintainer-scripts = "../packaging/deb/"
 
 [package.metadata.generate-rpm]
 name = "killbill-rs"
