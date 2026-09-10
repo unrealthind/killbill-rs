@@ -76,14 +76,17 @@ fn preflight_target(target: &Path) -> Result<(), String> {
     use std::os::unix::fs::FileTypeExt;
 
     let meta = std::fs::metadata(target).map_err(|e| {
-        let mut msg = format!("luks_destroy target {} cannot be read: {e}", target.display());
+        let mut msg = format!(
+            "luks_destroy target {} cannot be read: {e}",
+            target.display()
+        );
         // The shipped systemd unit sets `PrivateDevices=yes`, which gives the
         // daemon an empty private `/dev`. A real target under `/dev/` then looks
         // like it is missing. Point the operator at the fix rather than at their
         // disk layout.
         if e.kind() == std::io::ErrorKind::NotFound && target.starts_with("/dev/") {
             msg.push_str(
-                " — if killbilld runs under systemd, PrivateDevices=yes hides /dev; \
+                ". If killbilld runs under systemd, PrivateDevices=yes hides /dev: \
                  install the killbilld.service.d/luks-destroy.conf drop-in \
                  (see /usr/share/killbill-rs/) and run `systemctl daemon-reload`",
             );
