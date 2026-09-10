@@ -70,9 +70,25 @@ Arming runs a preflight and
 (loudly, leaving the daemon disarmed) if it cannot guarantee the kill path:
 an invalid config, a USB sensor that will not start, a reported event gap under
 .BR "on_sensor_gap = \(dqwarn\(dq" ,
-or a missing
+a missing
 .B CAP_SYS_BOOT
-capability.
+capability, or a
+.B [response.luks_destroy]
+target that is missing or is not a block device.
+.PP
+If a configured
+.B luks_destroy
+target reports as missing under the shipped unit, it is almost certainly
+.B PrivateDevices=yes
+hiding the real
+.IR /dev :
+install the
+.I killbilld.service.d/luks-destroy.conf
+drop-in (shipped under
+.IR /usr/share/killbill-rs/ )
+and run
+.BR "systemctl daemon-reload" .
+The daemon's preflight error says so too.
 .SH SIGNALS
 .TP
 .BR SIGTERM ", " SIGINT

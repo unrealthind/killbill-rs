@@ -62,5 +62,19 @@ testing.
   closed (server-side target/generation check) before the header wipe is ever
   implemented.
 
+### Known limitations
+
+- `killbilld` does not enumerate already-connected USB devices at startup. It
+  counts only `add` events seen since it started, so `max_count` treats a device
+  present before the daemon started as zero. Seed the table with
+  `udevadm trigger --action=add --subsystem-match=usb` while disarmed. See
+  `killbill.conf(5)` and the README.
+- A configured `[response.luks_destroy]` target is hidden by the shipped unit's
+  `PrivateDevices=yes` and will fail the arm-time preflight until the
+  `killbilld.service.d/luks-destroy.conf` drop-in is installed. The preflight
+  error and `killbilld(8)` both say so.
+- Config comments are lost when the daemon rewrites the file (a `whitelist add`
+  or `config set`).
+
 [Unreleased]: https://github.com/unrealthind/killbill-rs/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/unrealthind/killbill-rs/releases/tag/v0.1.0

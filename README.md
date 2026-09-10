@@ -200,6 +200,15 @@ sudo killbillctl arm
 
 Disarm is always `sudo killbillctl disarm` — never a signal.
 
+> **`max_count` and already-connected devices.** `killbilld` counts only the
+> `add` events it has seen since it started; it does not enumerate USB devices
+> that were already plugged in at startup (a v1 limitation). A device present
+> before the daemon started counts as zero against its `max_count`. To seed the
+> count table, run `udevadm trigger --action=add --subsystem-match=usb` **while
+> disarmed** — the synthetic `add` events are recorded and never fire. Don't run
+> it while armed under `on_sensor_gap = "kill"`: the burst can overflow the
+> netlink buffer and trip a real `SensorGap` kill.
+
 ---
 
 ## Architecture

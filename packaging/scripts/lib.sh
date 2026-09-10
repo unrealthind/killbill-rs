@@ -42,7 +42,7 @@ kb_install_config() {
 	chmod 0755 "$kb_config_dir"
 	if [ ! -e "$kb_config" ] && [ -e "$kb_example" ]; then
 		cp "$kb_example" "$kb_config"
-		chmod 0640 "$kb_config"
+		chmod 0600 "$kb_config"
 		echo "killbill-rs: wrote default config to ${kb_config} (disarmed)"
 	fi
 }

@@ -76,10 +76,19 @@ fn preflight_target(target: &Path) -> Result<(), String> {
     use std::os::unix::fs::FileTypeExt;
 
     let meta = std::fs::metadata(target).map_err(|e| {
-        format!(
-            "luks_destroy target {} cannot be read: {e}",
-            target.display()
-        )
+        let mut msg = format!("luks_destroy target {} cannot be read: {e}", target.display());
+        // The shipped systemd unit sets `PrivateDevices=yes`, which gives the
+        // daemon an empty private `/dev`. A real target under `/dev/` then looks
+        // like it is missing. Point the operator at the fix rather than at their
+        // disk layout.
+        if e.kind() == std::io::ErrorKind::NotFound && target.starts_with("/dev/") {
+            msg.push_str(
+                " — if killbilld runs under systemd, PrivateDevices=yes hides /dev; \
+                 install the killbilld.service.d/luks-destroy.conf drop-in \
+                 (see /usr/share/killbill-rs/) and run `systemctl daemon-reload`",
+            );
+        }
+        msg
     })?;
     if !meta.file_type().is_block_device() {
         return Err(format!(
@@ -141,9 +150,11 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn preflight_refuses_a_target_that_is_not_a_block_device() {
-        // A path that does not exist.
+        // A path that does not exist. A missing `/dev/` target also carries the
+        // PrivateDevices hint so a packaged install is not left guessing.
         let missing = LuksDestroyResponder::new(PathBuf::from("/dev/killbill-does-not-exist"));
-        assert!(missing.preflight().is_err());
+        let err = missing.preflight().unwrap_err();
+        assert!(err.reason.contains("PrivateDevices"), "{}", err.reason);
 
         // A regular file is not a block device.
         let dir = std::env::temp_dir().join(format!("killbilld-luks-{}", std::process::id()));
