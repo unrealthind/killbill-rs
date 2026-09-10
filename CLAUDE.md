@@ -95,6 +95,37 @@ path and destructive config, run both.
 
 ## Current state
 
+> **SNAPSHOT 2026-09-10 — Phases 1–3 are code-complete and all merged to
+> `main`.** Phase 3 landed via PR #2 (`e40e600`); the final v0.1.0 review-gate
+> fixes landed via PR #3 (`ee1554c`). `main` CI is green (fmt · clippy · test,
+> cargo-deny, MSRV build).
+>
+> **The v0.1.0 review gate is done.** Full-tree 4-agent pass 2026-09-09
+> (code-quality PASS, tui-ux PASS, kill-path-reliability PASS, security-auditor
+> BLOCK on CI action-pinning only — zero `.rs` changes). Every BLOCK/High/Medium
+> was fixed on `release-prep` and merged: all GitHub Actions pinned to commit
+> SHAs, `cargo install` versions pinned, `luks_destroy` preflight now hints at
+> the `PrivateDevices=yes` drop-in, `max_count`/no-coldplug documented, config
+> installs `0600`. Non-blocking items carried into the release: tui-ux S1–S4,
+> kill-path L1–L5, security L2/L4/L5/L6, code-quality's 3 nits — do not "fix"
+> these ad hoc; see the gate blocks below for why each was left.
+>
+> **Left before the tag — all human verification / mechanics, no authoring:**
+> 1. tui-ux's 11-item manual checklist (`NO_COLOR` / `TERM=dumb` / non-tty /
+>    resize / `kill -9` / `kill -TERM` / daemon-disappears / DESTROY-fence
+>    rigor / long-report / plug-and-whitelist).
+> 2. Clean-VM `.deb` + `.rpm` install (Phase 3 exit criterion), incl. the
+>    upgrade and remove paths.
+> 3. `minisign -G`; `gh secret set MINISIGN_SECRET_KEY` / `MINISIGN_PASSWORD`;
+>    pubkey into `README.md` (~line 166) and the release notes.
+> 4. `git tag -a v0.1.0` + push → `release.yml` drafts the release. First run
+>    fails `check-release.sh` on the `PKGBUILD` `SKIP` digest **by design** —
+>    `updpkgsums`, commit to `main`, re-dispatch `release.yml` with `tag=v0.1.0`
+>    (documented in `CONTRIBUTING.md` "Cutting a release").
+> 5. Edit the draft release, publish; push the AUR package.
+>
+> The step-by-step build history below is kept as the record.
+
 **Phase 1 steps 1–7 are committed and code-complete.** Steps 1–4 landed in
 `c5ec882`; steps 5–7 (USB sensor, control server, `killbillctl`) landed on the
 `phase-2-tui` branch after a full read-only audit and three rounds of fixes.
@@ -631,9 +662,10 @@ unreadable version and its `SKIP` grep is widened; `CONTRIBUTING.md` gained a
 sub-phase 10 (README rewrite, `.gitignore` reword, source comments repointed off
 `CLAUDE.md` — `git grep -i claude` on tracked files is clean bar the necessary
 `.gitignore` patterns), sub-phase 11 (charter §10 rewritten, §13 decisions 5–7
-added). Remaining for the tag: the full-tree 4-agent sign-off, the manual TUI
-checks (`NO_COLOR` / resize / `kill -9`), a clean-VM package install, `minisign
--G`, then commit + tag.
+added). The full-tree 4-agent sign-off is also DONE — see the SNAPSHOT at the
+top of "Current state" for what it found and what remains before the tag (all
+human verification: the manual TUI checklist, a clean-VM package install,
+`minisign -G` + secrets, then tag).
 
 After the `Conn::Down` fix + `cargo fmt --all`: `cargo fmt --all --check`,
 `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test
